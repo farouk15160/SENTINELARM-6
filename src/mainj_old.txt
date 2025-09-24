@@ -1,0 +1,396 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include "Arduino.h"
+#include <Adafruit_INA219.h>
+
+Adafruit_INA219 ina219 = Adafruit_INA219(0x41);
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+void scan_i2c_availble_address();
+
+// --- Core Safety & Configuration ---
+#define OE_PIN 13           // IMPORTANT: PCA9685 OE pin. Add 10k pull-up resistor to VCC!
+#define AUTO_HOME_ON_BOOT 1 // 0 = Wait for 'B' command, 1 = Auto-move on boot.
+
+#define SERVOS_NUMBER 6
+#define SERVO_MIN_US 500
+#define SERVO_MAX_US 2500
+#define PWM_FREQ 50
+
+
+// Speed is controlled by setting the total duration of a move in milliseconds.
+#define DURATION_MIN_MS 100        // Corresponds to 100% speed
+#define DURATION_MAX_MS 3000       // Corresponds to 1% speed
+uint16_t g_moveDuration_ms = 1500; // Default move duration
+
+const uint8_t SERVOS[SERVOS_NUMBER] = {10, 11, 12, 13, 14, 15};
+const float SERVOS_MIN[SERVOS_NUMBER] = {40.0f, 40.0f, 0.0f, 30.0f, 0.0f, 5.0f};
+const float SERVOS_MAX[SERVOS_NUMBER] = {150.0f, 150.0f, 145.0f, 130.0f, 120.0f, 120.0f};
+const float HOME_POSITION[SERVOS_NUMBER] = {90.00, 90.00, 90.00, 90.00, 90.00, 90.00};
+const bool SERVO_INVERT[SERVOS_NUMBER] = {true, false, false, false, false, false};
+const int16_t TRIM_US[SERVOS_NUMBER] = {52, 333, 0, 0, 0, 0};
+
+String serialBuffer = "";
+// Stores the last commanded pulse for each of the 16 PCA9685 channels.
+int currentPulse[16];
+// --- Math & Conversion Helpers ---
+int angleToPulse(float degrees)
+{
+  return map(degrees, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
+}
+
+float pulseToAngle(int pulse, int servoIndex)
+{
+  int pulseWithoutTrim = pulse - TRIM_US[servoIndex];
+  float degrees = (float)(pulseWithoutTrim - SERVO_MIN_US) * 180.0f / (float)(SERVO_MAX_US - SERVO_MIN_US);
+
+  if (SERVO_INVERT[servoIndex])
+  {
+    return 180.0f - degrees;
+  }
+  return degrees;
+}
+
+static inline float easeInOutCubic(float t)
+{
+  if (t < 0.5f)
+    return 4.0f * t * t * t;
+  float a = -2.0f * t + 2.0f;
+  return 1.0f - (a * a * a) / 2.0f;
+}
+
+// --- Core Motion Function ---
+void moveServosSmoothly(const uint8_t channels[], const float targetAngles[], uint8_t num_channels)
+{
+  int startPulse[num_channels];
+  int targetPulse[num_channels];
+  int deltaPulse[num_channels];
+
+  for (int i = 0; i < num_channels; i++)
+  {
+    uint8_t ch = channels[i];
+    int servo_idx = -1;
+    for (int j = 0; j < SERVOS_NUMBER; j++)
+      if (SERVOS[j] == ch)
+        servo_idx = j;
+    if (servo_idx == -1)
+      continue;
+
+    startPulse[i] = currentPulse[ch];
+    float safeAngle = constrain(targetAngles[i], SERVOS_MIN[servo_idx], SERVOS_MAX[servo_idx]);
+
+    if (SERVO_INVERT[servo_idx])
+    {
+      safeAngle = 180.0f - safeAngle;
+    }
+    targetPulse[i] = angleToPulse(safeAngle) + TRIM_US[servo_idx];
+    deltaPulse[i] = targetPulse[i] - startPulse[i];
+  }
+
+  unsigned long startTime = millis();
+  unsigned long currentTime;
+
+  // This loop calculates the position based on elapsed time for maximum smoothness
+  do
+  {
+    currentTime = millis();
+    float fraction = (float)(currentTime - startTime) / (float)g_moveDuration_ms;
+
+    if (fraction > 1.0f)
+    {
+      fraction = 1.0f;
+    }
+
+    float eased_fraction = easeInOutCubic(fraction);
+
+    for (int i = 0; i < num_channels; i++)
+    {
+      uint8_t ch = channels[i];
+      int pulse = startPulse[i] + (int)((float)deltaPulse[i] * eased_fraction);
+      pwm.writeMicroseconds(ch, pulse);
+    }
+
+    // Small delay to prevent overwhelming the I2C bus and to allow other processes.
+    // A 5ms delay gives a high refresh rate of 200Hz.
+    delay(5);
+
+  } while (currentTime - startTime < g_moveDuration_ms);
+
+  // After the loop, command the final target position to ensure accuracy
+  for (int i = 0; i < num_channels; i++)
+  {
+    uint8_t ch = channels[i];
+    pwm.writeMicroseconds(ch, targetPulse[i]);
+    currentPulse[ch] = targetPulse[i];
+  }
+}
+
+// --- Command Implementations ---
+void goHome(uint16_t duration)
+{
+  uint16_t savedDuration = g_moveDuration_ms;
+  g_moveDuration_ms = duration;
+  float home_pos_copy[SERVOS_NUMBER];
+  for (int i = 0; i < SERVOS_NUMBER; i++)
+    home_pos_copy[i] = HOME_POSITION[i];
+  home_pos_copy[1] = home_pos_copy[0]; // Ensure base is linked
+  moveServosSmoothly(SERVOS, home_pos_copy, SERVOS_NUMBER);
+  g_moveDuration_ms = savedDuration;
+}
+
+void parseSerialCommand(String cmd)
+{
+  cmd.trim();
+  if (cmd.length() == 0)
+    return;
+
+  char commandType = cmd.charAt(0);
+  String args = cmd.substring(cmd.indexOf(',') + 1);
+
+  switch (commandType)
+  {
+  case 'B': // Begin command, used if AUTO_HOME_ON_BOOT is 0
+    Serial.println("INFO: BEGIN received. Performing slow move to HOME.");
+    goHome(4000);
+    break;
+
+  case 'H':
+    Serial.println("INFO: Moving to home position.");
+    goHome(1500);
+    break;
+
+  case 'M':
+  {
+    const int expected_angles = SERVOS_NUMBER - 1;
+    float receivedAngles[expected_angles];
+    int argCount = 0;
+    int lastIndex = 0;
+    for (int i = 0; i < args.length(); i++)
+    {
+      if (args.charAt(i) == ',')
+      {
+        if (argCount < expected_angles)
+        {
+          receivedAngles[argCount++] = args.substring(lastIndex, i).toFloat();
+          lastIndex = i + 1;
+        }
+      }
+    }
+    if (argCount < expected_angles)
+    {
+      receivedAngles[argCount++] = args.substring(lastIndex).toFloat();
+    }
+    if (argCount != expected_angles)
+    {
+      Serial.printf("ERROR: M command expects %d angles, got %d.\n", expected_angles, argCount);
+      return;
+    }
+    float targetAngles[SERVOS_NUMBER];
+    targetAngles[0] = receivedAngles[0];
+    targetAngles[1] = receivedAngles[0];
+    for (int i = 1; i < expected_angles; i++)
+    {
+      targetAngles[i + 1] = receivedAngles[i];
+    }
+    Serial.println("Moving all joints...");
+    moveServosSmoothly(SERVOS, targetAngles, SERVOS_NUMBER);
+    break;
+  }
+
+  case 'J':
+  {
+    int first_comma = args.indexOf(',');
+    if (first_comma == -1)
+    {
+      Serial.println("ERROR: J command requires two arguments. J,index,angle");
+      return;
+    }
+    int joint_idx = args.substring(0, first_comma).toInt();
+    float target_angle = args.substring(first_comma + 1).toFloat();
+    if (joint_idx < 0 || joint_idx >= SERVOS_NUMBER)
+    {
+      Serial.println("ERROR: Invalid joint index.");
+      return;
+    }
+
+    Serial.printf("Moving joint %d...\n", joint_idx);
+
+    if (joint_idx == 0 || joint_idx == 1)
+    {
+      uint8_t channels[] = {SERVOS[0], SERVOS[1]};
+      float angles[] = {target_angle, target_angle};
+      moveServosSmoothly(channels, angles, 2);
+    }
+    else
+    {
+      uint8_t channels[] = {SERVOS[joint_idx]};
+      float angles[] = {target_angle};
+      moveServosSmoothly(channels, angles, 1);
+    }
+    break;
+  }
+
+  case 'S':
+  {
+    int speed_val = args.toInt();
+    if (speed_val < DURATION_MIN_MS || speed_val > DURATION_MAX_MS)
+    {
+      Serial.printf("ERROR: Speed duration must be between %d and %d ms.\n", DURATION_MIN_MS, DURATION_MAX_MS);
+      return;
+    }
+    g_moveDuration_ms = speed_val;
+    Serial.printf("Move duration set to %d ms.\n", g_moveDuration_ms);
+    break;
+  }
+
+  case 'T':
+  {
+    Serial.println("--- Current Robot Position (Angles) ---");
+    for (int i = 0; i < SERVOS_NUMBER; i++)
+    {
+      float currentAngle = pulseToAngle(currentPulse[SERVOS[i]], i);
+      Serial.printf("Servo %d: %.2f deg\n", i, currentAngle);
+    }
+    Serial.println("------------------------------------");
+    break;
+  }
+
+  default:
+    Serial.printf("ERROR: Unknown command '%c'.\n", commandType);
+    break;
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial)
+    ;
+  Serial.println("\n--- Safe Servo Boot Initializing ---");
+
+  pinMode(OE_PIN, OUTPUT);
+  digitalWrite(OE_PIN, HIGH);
+  Serial.println("Step 1: Outputs DISABLED.");
+
+  Wire.begin();
+  scan_i2c_availble_address();
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(PWM_FREQ);
+  ina219.begin();
+  delay(10);
+  Serial.println("Step 2: PCA9685 initialized.");
+
+  uint16_t restored_us[SERVOS_NUMBER];
+
+  Serial.println("Step 3: No EEPROM pose found. Using CENTER position.");
+  for (int i = 0; i < SERVOS_NUMBER; i++)
+  {
+    restored_us[i] = (SERVO_MIN_US + SERVO_MAX_US) / 2;
+  }
+
+  for (int i = 0; i < SERVOS_NUMBER; i++)
+  {
+    uint8_t ch = SERVOS[i];
+    currentPulse[ch] = restored_us[i];
+    pwm.writeMicroseconds(ch, currentPulse[ch]);
+  }
+
+  digitalWrite(OE_PIN, LOW);
+  Serial.println("Step 4: Outputs ENABLED. Arm is holding last position.");
+  delay(500);
+
+#if AUTO_HOME_ON_BOOT
+  Serial.println("Step 5: Auto slow-move to HOME.");
+  goHome(4000);
+  Serial.println("\n--- Ready to receive commands ---");
+#else
+  Serial.println("SAFE MODE: Waiting for BEGIN ('B') command. No auto movement.");
+#endif
+}
+
+void loop()
+{
+  // float busVoltage = ina219.getBusVoltage_V();
+  // float shuntVoltage = ina219.getShuntVoltage_mV() / 1000.0;
+  // float current_mA = ina219.getCurrent_mA();
+  // float power_mW = ina219.getPower_mW();
+
+  // // Combine bus voltage + shunt voltage
+  // float loadVoltage = busVoltage + shuntVoltage;
+  // Serial.print("Bus Voltage: ");
+  // Serial.print(busVoltage);
+  // Serial.println(" V");
+  // Serial.print("Shunt Voltage: ");
+  // Serial.print(shuntVoltage);
+  // Serial.println(" V");
+  // Serial.print("Load Voltage: ");
+  // Serial.print(loadVoltage);
+  // Serial.println(" V");
+  // Serial.print("Current: ");
+  // Serial.print(current_mA);
+  // Serial.println(" mA");
+  // Serial.print("Power: ");
+  // Serial.print(power_mW);
+  // Serial.println(" mW");
+  // Serial.println("");
+
+  while (Serial.available())
+  {
+
+    char c = Serial.read();
+    if (c == '\n')
+    {
+      if (serialBuffer.length() > 0)
+      {
+
+        parseSerialCommand(serialBuffer);
+      }
+      serialBuffer = "";
+    }
+    else
+    {
+      serialBuffer += c;
+    }
+  }
+}
+
+void scan_i2c_availble_address()
+{
+  byte error, address;
+  int nDevices;
+  Serial.println("Scanning...");
+  nDevices = 0;
+  for (address = 1; address < 127; address++)
+  {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0)
+    {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16)
+      {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+      nDevices++;
+    }
+    else if (error == 4)
+    {
+      Serial.print("Unknow error at address 0x");
+      if (address < 16)
+      {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+    }
+  }
+  if (nDevices == 0)
+  {
+    Serial.println("No I2C devices found\n");
+  }
+  else
+  {
+    Serial.println("done\n");
+  }
+}
