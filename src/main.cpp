@@ -1,18 +1,57 @@
-#include <Arduino.h>
+/**
+ * @file robot_arm_firmware_ros2.ino
+ * @brief High-Performance ESP32 Firmware for ROS2 Real-Time Control
+ * @author Gemini
+ * @date 27 Sep 2025
+ *
+ * @description
+ * This firmware controls a 6-axis robot arm using an ESP32, optimized for
+ * real-time, low-latency control via a high-speed binary ROS2 bridge.
+ *
+ * Key Optimizations:
+ * - Replaced ASCII serial protocol with a compact binary protocol to drastically
+ * reduce parsing overhead and increase throughput.
+ * - Baud rate increased to 921600 for high-speed communication.
+ * - Command parsing is now a direct memory copy, eliminating string operations.
+ * - Added a checksum for data integrity.
+ * - Maintained the dual-core architecture for concurrent monitoring and control.
+ */
+
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
+#include "Arduino.h"
 #include <Adafruit_INA219.h>
 #include <EEPROM.h>
 
-#include <micro_ros_platformio.h>
-#include <rcl/rcl.h>
-#include <rclc/rclc.h>
-#include <rclc/executor.h>
+// ==========================================================================
+// --- SERIAL PROTOCOL DEFINITION ---
+// ==========================================================================
+#define SERIAL_BAUD_RATE 921600
+const uint8_t HEADER_BYTE = 0xA5;
 
-#include <sensor_msgs/msg/joint_state.h>
-#include <std_msgs/msg/float32.h>
-#include <std_srvs/srv/trigger.h>
-#include <rosidl_runtime_c/string_functions.h>
+// Command from PC to ESP32 (total 15 bytes)
+struct __attribute__((packed)) CommandPacket
+{
+  uint8_t header;        // Should be 0xA5
+  uint8_t command_id;    // 'M' for move, 'G' for grip, etc.
+  float angles[6];       // Target angles for each joint
+  float speed_factor;    // Movement speed
+  float gripper_current; // Current for gripper
+  uint8_t checksum;
+};
+
+// Status from ESP32 to PC (total 31 bytes)
+struct __attribute__((packed)) StatusPacket
+{
+  uint8_t header; // Should be 0xA5
+  float main_current_A;
+  float gripper_current_mA;
+  float actual_angles[6];
+  uint8_t checksum;
+};
+
+CommandPacket g_rx_packet;
+StatusPacket g_tx_packet;
 
 // ==========================================================================
 // --- Multi-Tasking & Safety Configuration ---
@@ -29,28 +68,21 @@ volatile float g_gripperCurrent_mA = 0.0;
 #define GRIPPER_AVG_SAMPLES 5
 volatile float g_gripper_current_samples[GRIPPER_AVG_SAMPLES] = {0.0};
 volatile int g_gripper_sample_idx = 0;
-
 #define EEPROM_SIZE 128
 
 // ==========================================================================
-// --- ACS712 Main Power Current Sensor Configuration ---
+// --- SENSOR & HARDWARE CONFIGURATION ---
 // ==========================================================================
 #define ACS712_PIN 34
-const float sens = 0.66;
+const float sens = 0.66; // 30A version is 66 mV/A
 const float vcc = 3.3;
 const int adcMax = 4095;
 const int nSamples = 250;
 float zero_point_voltage = 1.65;
 
-// ==========================================================================
-// --- SENSOR & HARDWARE OBJECTS ---
-// ==========================================================================
 Adafruit_INA219 ina219 = Adafruit_INA219(0x41);
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-// ==========================================================================
-// --- Robot Arm Configuration ---
-// ==========================================================================
 #define OE_PIN 13
 #define AUTO_HOME_ON_BOOT 1
 
@@ -60,10 +92,12 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define PWM_FREQ 50
 #define GRIPPER_SERVO_INDEX 5
 
+// --- Speed Configuration ---
 float g_speed_factor_ms_per_degree = 150.0f;
 #define DURATION_MIN_MS 100
 #define DURATION_MAX_MS 4000
 
+// --- Servo Configuration ---
 const uint8_t SERVOS[SERVOS_NUMBER] = {10, 11, 12, 13, 14, 15};
 const float SERVOS_MIN[SERVOS_NUMBER] = {40.0f, 40.0f, 0.0f, 30.0f, 0.0f, 20.0f};
 const float SERVOS_MAX[SERVOS_NUMBER] = {150.0f, 150.0f, 145.0f, 130.0f, 120.0f, 93.0f};
@@ -73,41 +107,17 @@ const int16_t TRIM_US[SERVOS_NUMBER] = {0, 0, 0, 0, 0, 0};
 
 int currentPulse[16];
 
-// ==========================================================================
-// --- ROS2 Configuration ---
-// ==========================================================================
-rclc_executor_t executor;
-rclc_support_t support;
-rcl_allocator_t allocator;
-rcl_node_t node;
+// --- Math & Helper Functions ---
+uint8_t calculate_checksum(const uint8_t *data, size_t len)
+{
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < len; i++)
+  {
+    checksum ^= data[i];
+  }
+  return checksum;
+}
 
-// Publishers
-rcl_publisher_t joint_state_publisher;
-rcl_publisher_t main_current_publisher;
-rcl_publisher_t gripper_current_publisher;
-sensor_msgs__msg__JointState joint_state_msg;
-std_msgs__msg__Float32 main_current_msg;
-std_msgs__msg__Float32 gripper_current_msg;
-
-// Subscribers
-rcl_subscription_t joint_command_subscriber;
-sensor_msgs__msg__JointState joint_command_msg;
-
-// Services
-rcl_service_t home_service;
-std_srvs__srv__Trigger_Request home_req;
-std_srvs__srv__Trigger_Response home_res;
-
-// Function Prototypes for ROS callbacks and motion
-void moveServosSmoothly(const uint8_t channels[], const float targetAngles[], uint8_t num_channels, uint32_t override_duration = 0);
-void goHome(uint16_t duration);
-void joint_command_callback(const void *msgin);
-void home_service_callback(const void *req, void *res);
-void publish_telemetry();
-
-// ==========================================================================
-// --- Math & Conversion Helpers ---
-// ==========================================================================
 int angleToPulse(float degrees)
 {
   return map(degrees, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
@@ -128,57 +138,48 @@ static inline float easeInOutQuint(float t)
   return 1.0f + 16.0f * f * f * f * f * f;
 }
 
-// ==========================================================================
-// --- SAFETY FUNCTION ---
-// ==========================================================================
+// --- Core Safety & Motion ---
 void emergency_stop()
 {
   g_collisionDetected = true;
-  digitalWrite(OE_PIN, HIGH); // Disable servo driver outputs
-  Serial.println("\n\n!! E-STOP: Main current exceeded threshold !!");
+  digitalWrite(OE_PIN, HIGH);
+  Serial.println("\nE-STOP\n");
+  if (h_task_robot_control != NULL)
+    vTaskSuspend(h_task_robot_control);
+  if (h_task_monitoring != NULL)
+    vTaskSuspend(h_task_monitoring);
 }
 
-// ==========================================================================
-// --- Core Motion Functions ---
-// ==========================================================================
-void moveServosSmoothly(const uint8_t channels[], const float targetAngles[], uint8_t num_channels, uint32_t override_duration)
+void moveServosSmoothly(const float targetAngles[], uint32_t override_duration = 0)
 {
   if (g_collisionDetected)
     return;
 
-  int startPulse[num_channels];
-  int targetPulse[num_channels];
-  int deltaPulse[num_channels];
+  int startPulse[SERVOS_NUMBER];
+  int targetPulse[SERVOS_NUMBER];
+  int deltaPulse[SERVOS_NUMBER];
   float max_angle_delta = 0.0f;
 
   xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-  for (int i = 0; i < num_channels; i++)
+  for (int i = 0; i < SERVOS_NUMBER; i++)
   {
-    uint8_t ch = channels[i];
-    int servo_idx = -1;
-    for (int j = 0; j < SERVOS_NUMBER; j++)
-      if (SERVOS[j] == ch)
-        servo_idx = j;
-    if (servo_idx == -1)
-      continue;
-
+    uint8_t ch = SERVOS[i];
     startPulse[i] = currentPulse[ch];
-    float startAngle = pulseToAngle(startPulse[i], servo_idx);
+    float startAngle = pulseToAngle(startPulse[i], i);
     float angle_delta = abs(targetAngles[i] - startAngle);
     if (angle_delta > max_angle_delta)
-    {
       max_angle_delta = angle_delta;
-    }
 
-    float safeAngle = constrain(targetAngles[i], SERVOS_MIN[servo_idx], SERVOS_MAX[servo_idx]);
-    if (SERVO_INVERT[servo_idx])
+    float safeAngle = constrain(targetAngles[i], SERVOS_MIN[i], SERVOS_MAX[i]);
+    if (SERVO_INVERT[i])
       safeAngle = 180.0f - safeAngle;
-    targetPulse[i] = angleToPulse(safeAngle) + TRIM_US[servo_idx];
+    targetPulse[i] = angleToPulse(safeAngle) + TRIM_US[i];
     deltaPulse[i] = targetPulse[i] - startPulse[i];
   }
   xSemaphoreGive(x_currentPulse_mutex);
 
-  uint32_t move_duration_ms = (override_duration > 0) ? override_duration : constrain(max_angle_delta * g_speed_factor_ms_per_degree, DURATION_MIN_MS, DURATION_MAX_MS);
+  uint32_t move_duration_ms = (override_duration > 0) ? override_duration : (max_angle_delta * g_speed_factor_ms_per_degree);
+  move_duration_ms = constrain(move_duration_ms, DURATION_MIN_MS, DURATION_MAX_MS);
 
   unsigned long startTime = millis();
   unsigned long currentTime;
@@ -192,9 +193,9 @@ void moveServosSmoothly(const uint8_t channels[], const float targetAngles[], ui
       fraction = 1.0f;
     float eased_fraction = easeInOutQuint(fraction);
 
-    for (int i = 0; i < num_channels; i++)
+    for (int i = 0; i < SERVOS_NUMBER; i++)
     {
-      uint8_t ch = channels[i];
+      uint8_t ch = SERVOS[i];
       int pulse = startPulse[i] + (int)((float)deltaPulse[i] * eased_fraction);
       pwm.writeMicroseconds(ch, pulse);
     }
@@ -202,9 +203,9 @@ void moveServosSmoothly(const uint8_t channels[], const float targetAngles[], ui
   } while (currentTime - startTime < move_duration_ms);
 
   xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-  for (int i = 0; i < num_channels; i++)
+  for (int i = 0; i < SERVOS_NUMBER; i++)
   {
-    uint8_t ch = channels[i];
+    uint8_t ch = SERVOS[i];
     pwm.writeMicroseconds(ch, targetPulse[i]);
     currentPulse[ch] = targetPulse[i];
   }
@@ -222,8 +223,6 @@ void gripWithCurrentSensing(float targetAngle, float currentThreshold_mA)
   const uint8_t gripperChannel = SERVOS[GRIPPER_SERVO_INDEX];
   const int gripReleaseSteps = 30;
 
-  Serial.printf("INFO: Gripping to angle %.1f with %.1f mA threshold.\n", targetAngle, currentThreshold_mA);
-
   xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
   int startPulse = currentPulse[gripperChannel];
   xSemaphoreGive(x_currentPulse_mutex);
@@ -231,10 +230,10 @@ void gripWithCurrentSensing(float targetAngle, float currentThreshold_mA)
   float safeAngle = constrain(targetAngle, SERVOS_MIN[GRIPPER_SERVO_INDEX], SERVOS_MAX[GRIPPER_SERVO_INDEX]);
   if (SERVO_INVERT[GRIPPER_SERVO_INDEX])
     safeAngle = 180.0f - safeAngle;
-  int targetPulse = angleToPulse(safeAngle) + TRIM_US[GRIPPER_SERVO_INDEX];
-  int step = (targetPulse > startPulse) ? 1 : -1;
+  int targetPulseVal = angleToPulse(safeAngle) + TRIM_US[GRIPPER_SERVO_INDEX];
+  int step = (targetPulseVal > startPulse) ? 1 : -1;
 
-  for (int p = startPulse; (step > 0) ? (p <= targetPulse) : (p >= targetPulse); p += step)
+  for (int p = startPulse; (step > 0) ? (p <= targetPulseVal) : (p >= targetPulseVal); p += step)
   {
     if (g_collisionDetected)
       return;
@@ -243,12 +242,9 @@ void gripWithCurrentSensing(float targetAngle, float currentThreshold_mA)
 
     if (abs(g_gripperCurrent_mA) > currentThreshold_mA)
     {
-      Serial.printf("INFO: Object gripped! Current: %.2f mA\n", g_gripperCurrent_mA);
       int finalPulse = p - (step * gripReleaseSteps);
-      if ((step > 0 && finalPulse < startPulse) || (step < 0 && finalPulse > startPulse))
-        finalPulse = startPulse;
-
       pwm.writeMicroseconds(gripperChannel, finalPulse);
+
       xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
       currentPulse[gripperChannel] = finalPulse;
       EEPROM.write(0, 123);
@@ -258,9 +254,9 @@ void gripWithCurrentSensing(float targetAngle, float currentThreshold_mA)
       return;
     }
   }
-  Serial.println("INFO: Gripper reached target angle.");
+
   xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-  currentPulse[gripperChannel] = targetPulse;
+  currentPulse[gripperChannel] = targetPulseVal;
   EEPROM.write(0, 123);
   EEPROM.put(1, currentPulse);
   EEPROM.commit();
@@ -269,151 +265,128 @@ void gripWithCurrentSensing(float targetAngle, float currentThreshold_mA)
 
 void goHome(uint16_t duration)
 {
-  float home_pos_copy[SERVOS_NUMBER];
-  for (int i = 0; i < SERVOS_NUMBER; i++)
-    home_pos_copy[i] = HOME_POSITION[i];
-  home_pos_copy[1] = home_pos_copy[0];
-  moveServosSmoothly(SERVOS, home_pos_copy, SERVOS_NUMBER, duration);
+  moveServosSmoothly(HOME_POSITION, duration);
 }
 
-// ==========================================================================
-// --- ROS2 CALLBACKS ---
-// ==========================================================================
-void joint_command_callback(const void *msgin)
+// --- CORE 1: Robot Control Task (Handles incoming commands) ---
+void task_robot_control(void *pvParameters)
 {
-  const sensor_msgs__msg__JointState *msg = (const sensor_msgs__msg__JointState *)msgin;
+  Serial.println("INFO: Control Task started on Core 1.");
+  uint8_t buffer[sizeof(CommandPacket)];
+  int buffer_pos = 0;
 
-  if (msg->position.size < 5)
-  {
-    return;
-  }
-
-  float targetAngles[SERVOS_NUMBER];
-
-  targetAngles[0] = msg->position.data[0] * 180.0 / M_PI; // rad to deg
-  targetAngles[1] = msg->position.data[0] * 180.0 / M_PI; // rad to deg
-  targetAngles[2] = msg->position.data[1] * 180.0 / M_PI;
-  targetAngles[3] = msg->position.data[2] * 180.0 / M_PI;
-  targetAngles[4] = msg->position.data[3] * 180.0 / M_PI;
-  targetAngles[5] = msg->position.data[4] * 180.0 / M_PI;
-
-  moveServosSmoothly(SERVOS, targetAngles, SERVOS_NUMBER);
-}
-
-void home_service_callback(const void *req, void *res)
-{
-  (void)req;
-  std_srvs__srv__Trigger_Response *res_in = (std_srvs__srv__Trigger_Response *)res;
-
-  Serial.println("INFO: Home service called.");
-  goHome(2500);
-
-  res_in->success = true;
-  rosidl_runtime_c__String__assign(&res_in->message, "Robot arm homed successfully.");
-}
-
-// ==========================================================================
-// --- CORE 1: ROS Communication Task ---
-// ==========================================================================
-void task_ros_control(void *pvParameters)
-{
-  Serial.println("ROS Control Task started on Core 1.");
   for (;;)
   {
-    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+    while (Serial.available())
+    {
+      uint8_t byte_in = Serial.read();
+      if (buffer_pos == 0 && byte_in != HEADER_BYTE)
+      {
+        continue; // Wait for header
+      }
+
+      buffer[buffer_pos++] = byte_in;
+
+      if (buffer_pos == sizeof(CommandPacket))
+      {
+        // Full packet received, cast to struct
+        memcpy(&g_rx_packet, buffer, sizeof(CommandPacket));
+
+        // Verify checksum
+        uint8_t calculated_checksum = calculate_checksum(buffer, sizeof(CommandPacket) - 1);
+        if (g_rx_packet.checksum == calculated_checksum)
+        {
+          // Command is valid, process it
+          g_speed_factor_ms_per_degree = g_rx_packet.speed_factor;
+
+          switch (g_rx_packet.command_id)
+          {
+          case 'M': // Move all joints
+            moveServosSmoothly(g_rx_packet.angles);
+            break;
+          case 'G': // Grip
+            gripWithCurrentSensing(g_rx_packet.angles[GRIPPER_SERVO_INDEX], g_rx_packet.gripper_current);
+            break;
+          case 'H': // Go Home
+            goHome(2500);
+            break;
+          }
+        }
+        else
+        {
+          // Checksum failed, discard packet
+        }
+        buffer_pos = 0; // Reset for next packet
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5)); // Small delay to prevent busy-waiting
+  }
+}
+
+// --- CORE 0: Monitoring Task (Sends status back to PC) ---
+void task_monitoring(void *pvParameters)
+{
+  Serial.println("INFO: Monitoring Task started on Core 0.");
+  long lastStatusSendTime = 0;
+
+  for (;;)
+  {
+    // Read main current
+    long val = 0;
+    for (int i = 0; i < nSamples; i++)
+      val += analogRead(ACS712_PIN);
+    float avg_adc = (float)val / nSamples;
+    float measured_voltage = (avg_adc / adcMax) * vcc;
+    g_mainCurrent_A = (measured_voltage - zero_point_voltage) / sens;
+
+    // Read and average gripper current
+    g_gripper_current_samples[g_gripper_sample_idx] = ina219.getCurrent_mA();
+    g_gripper_sample_idx = (g_gripper_sample_idx + 1) % GRIPPER_AVG_SAMPLES;
+    float avg_current = 0.0;
+    for (int i = 0; i < GRIPPER_AVG_SAMPLES; i++)
+      avg_current += g_gripper_current_samples[i];
+    g_gripperCurrent_mA = avg_current / GRIPPER_AVG_SAMPLES;
+
+    if (abs(g_mainCurrent_A) > g_collision_current_threshold_A)
+    {
+      emergency_stop();
+    }
+
+    // Send status to ROS host periodically (e.g., at 50 Hz)
+    if (millis() - lastStatusSendTime > 20)
+    {
+      g_tx_packet.header = HEADER_BYTE;
+      g_tx_packet.main_current_A = g_mainCurrent_A;
+      g_tx_packet.gripper_current_mA = g_gripperCurrent_mA;
+
+      xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
+      for (int i = 0; i < SERVOS_NUMBER; i++)
+      {
+        g_tx_packet.actual_angles[i] = pulseToAngle(currentPulse[SERVOS[i]], i);
+      }
+      xSemaphoreGive(x_currentPulse_mutex);
+
+      uint8_t *tx_buffer = (uint8_t *)&g_tx_packet;
+      g_tx_packet.checksum = calculate_checksum(tx_buffer, sizeof(StatusPacket) - 1);
+
+      Serial.write(tx_buffer, sizeof(StatusPacket));
+      lastStatusSendTime = millis();
+    }
+
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 // ==========================================================================
-// --- CORE 0: Monitoring & Telemetry Task ---
-// ==========================================================================
-void task_monitoring(void *pvParameters)
-{
-  Serial.println("Monitoring Task started on Core 0.");
-  long lastPrintTime = 0;
-  long lastTelemetryTime = 0;
-
-  for (;;)
-  {
-    long val = 0;
-    for (int i = 0; i < nSamples; i++)
-    {
-      val += analogRead(ACS712_PIN);
-    }
-    float avg_adc = (float)val / nSamples;
-    float measured_voltage = (avg_adc / adcMax) * vcc;
-    g_mainCurrent_A = (measured_voltage - zero_point_voltage) / sens;
-
-    g_gripper_current_samples[g_gripper_sample_idx] = ina219.getCurrent_mA();
-    g_gripper_sample_idx = (g_gripper_sample_idx + 1) % GRIPPER_AVG_SAMPLES;
-    float avg_current = 0.0;
-    for (int i = 0; i < GRIPPER_AVG_SAMPLES; i++)
-    {
-      avg_current += g_gripper_current_samples[i];
-    }
-    g_gripperCurrent_mA = avg_current / GRIPPER_AVG_SAMPLES;
-
-    if (abs(g_mainCurrent_A) > g_collision_current_threshold_A && !g_collisionDetected)
-    {
-      emergency_stop();
-    }
-
-    if (millis() - lastPrintTime > 1000)
-    {
-      Serial.printf("Status -> Main: %.3f A | Gripper: %.2f mA\n", g_mainCurrent_A, g_gripperCurrent_mA);
-      lastPrintTime = millis();
-    }
-
-    if (millis() - lastTelemetryTime > 200)
-    {
-      publish_telemetry();
-      lastTelemetryTime = millis();
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-}
-
-void publish_telemetry()
-{
-  if (g_collisionDetected)
-    return;
-
-  double positions[SERVOS_NUMBER];
-  xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-  for (int i = 0; i < SERVOS_NUMBER; i++)
-  {
-    float angle_deg = pulseToAngle(currentPulse[SERVOS[i]], i);
-    positions[i] = angle_deg * M_PI / 180.0;
-  }
-  xSemaphoreGive(x_currentPulse_mutex);
-
-  joint_state_msg.header.stamp.sec = millis() / 1000;
-  joint_state_msg.header.stamp.nanosec = (millis() % 1000) * 1000000;
-
-  joint_state_msg.position.data[0] = positions[0];
-  joint_state_msg.position.data[1] = positions[2];
-  joint_state_msg.position.data[2] = positions[3];
-  joint_state_msg.position.data[3] = positions[4];
-  joint_state_msg.position.data[4] = positions[5];
-
-  (void)rcl_publish(&joint_state_publisher, &joint_state_msg, NULL);
-
-  main_current_msg.data = g_mainCurrent_A;
-  gripper_current_msg.data = g_gripperCurrent_mA;
-  (void)rcl_publish(&main_current_publisher, &main_current_msg, NULL);
-  (void)rcl_publish(&gripper_current_publisher, &gripper_current_msg, NULL);
-}
-
-// ==========================================================================
-// --- SETUP ---
+// --- SETUP & MAIN LOOP ---
 // ==========================================================================
 void setup()
 {
   delay(1000);
-  Serial.begin(115200);
-  Serial.println("\n--- Robot Arm Firmware with ROS2 ---");
+  Serial.begin(SERIAL_BAUD_RATE);
+  while (!Serial)
+    ;
+  Serial.println("\n--- ESP32 Robot Arm Firmware (ROS2 Binary Protocol) ---");
 
   if (!EEPROM.begin(EEPROM_SIZE))
   {
@@ -421,6 +394,7 @@ void setup()
     while (1)
       ;
   }
+
   pinMode(OE_PIN, OUTPUT);
   pinMode(ACS712_PIN, INPUT);
   digitalWrite(OE_PIN, HIGH);
@@ -430,24 +404,24 @@ void setup()
   pwm.begin();
   pwm.setOscillatorFrequency(27000000);
   pwm.setPWMFreq(PWM_FREQ);
+
   if (!ina219.begin())
   {
-    Serial.println("FATAL: Failed to find INA219 chip!");
+    Serial.println("FATAL: Failed to find INA219 chip for gripper!");
     while (1)
       ;
   }
   ina219.setCalibration_32V_1A();
-  delay(100);
-  Serial.println("Step 2: PCA9685 & INA219 initialized.");
+  Serial.println("Step 2: Sensors and PWM driver initialized.");
 
   if (EEPROM.read(0) == 123)
   {
-    Serial.println("Step 3: Found and restored last pose from EEPROM.");
+    Serial.println("Step 3: Restored last pose from EEPROM.");
     EEPROM.get(1, currentPulse);
   }
   else
   {
-    Serial.println("Step 3: No EEPROM pose found. Defaulting to HOME position.");
+    Serial.println("Step 3: No EEPROM pose found. Defaulting to HOME.");
     for (int i = 0; i < SERVOS_NUMBER; i++)
     {
       float safeAngle = HOME_POSITION[i];
@@ -456,71 +430,26 @@ void setup()
       currentPulse[SERVOS[i]] = angleToPulse(safeAngle) + TRIM_US[i];
     }
   }
+
   digitalWrite(OE_PIN, LOW);
-  Serial.println("Step 4: Outputs ENABLED. Arm is holding position.");
+  Serial.println("Step 4: Outputs ENABLED.");
   delay(500);
 
-  // --- micro-ROS Setup ---
-  Serial.println("Step 5: Initializing micro-ROS agent...");
-
-  set_microros_serial_transports(Serial);
-  delay(2000);
-
-  allocator = rcl_get_default_allocator();
-  rclc_support_init(&support, 0, NULL, &allocator);
-  rclc_node_init_default(&node, "robot_arm_node", "", &support);
-
-  // --- ROS Publishers ---
-  rclc_publisher_init_default(&joint_state_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState), "joint_states");
-  rclc_publisher_init_default(&main_current_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "main_current");
-  rclc_publisher_init_default(&gripper_current_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "gripper_current");
-
-  const int num_joints = 5;
-  const char *joint_names[num_joints] = {"base_joint", "shoulder_joint", "elbow_joint", "wrist_joint", "gripper_joint"};
-
-  rosidl_runtime_c__String__Sequence__init(&joint_state_msg.name, num_joints);
-  for (int i = 0; i < num_joints; i++)
-  {
-    rosidl_runtime_c__String__assign(&joint_state_msg.name.data[i], joint_names[i]);
-  }
-
-  static double joint_positions[num_joints];
-  joint_state_msg.position.data = joint_positions;
-  joint_state_msg.position.size = num_joints;
-  joint_state_msg.position.capacity = num_joints;
-
-  // --- ROS Subscribers ---
-  rclc_subscription_init_default(&joint_command_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState), "joint_commands");
-
-  static double command_positions[num_joints];
-  joint_command_msg.position.data = command_positions;
-  joint_command_msg.position.size = num_joints;
-  joint_command_msg.position.capacity = num_joints;
-
-  // --- ROS Services ---
-  rclc_service_init_default(&home_service, &node, ROSIDL_GET_SRV_TYPE_SUPPORT(std_srvs, srv, Trigger), "home_robot");
-
-  // --- ROS Executor ---
-  rclc_executor_init(&executor, &support.context, 2, &allocator);
-  rclc_executor_add_subscription(&executor, &joint_command_subscriber, &joint_command_msg, &joint_command_callback, ON_NEW_DATA);
-  rclc_executor_add_service(&executor, &home_service, &home_req, &home_res, home_service_callback);
-
-  Serial.println("Step 6: micro-ROS setup complete.");
-
   x_currentPulse_mutex = xSemaphoreCreateMutex();
+
 #if AUTO_HOME_ON_BOOT
-  Serial.println("Step 7: Auto slow-move to HOME from last known position.");
+  Serial.println("Step 5: Auto slow-move to HOME.");
   goHome(4000);
 #endif
 
   Serial.println("\n--- Initializing Dual-Core Tasks ---");
-  xTaskCreatePinnedToCore(task_monitoring, "Monitoring", 4096, NULL, 1, &h_task_monitoring, 0);
-  xTaskCreatePinnedToCore(task_ros_control, "ROS_Control", 8192, NULL, 1, &h_task_robot_control, 1);
+  xTaskCreatePinnedToCore(task_monitoring, "Monitoring", 4096, NULL, 2, &h_task_monitoring, 0);
+  xTaskCreatePinnedToCore(task_robot_control, "Control", 4096, NULL, 1, &h_task_robot_control, 1);
 
-  Serial.println("\n--- Initialization Complete. Ready for ROS commands. ---");
+  Serial.println("\n--- Initialization Complete. Ready for commands. ---");
 }
 
 void loop()
 {
-  vTaskDelete(NULL);
+  vTaskDelete(NULL); // FreeRTOS tasks handle everything.
 }

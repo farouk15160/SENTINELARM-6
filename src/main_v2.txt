@@ -483,7 +483,7 @@ void task_monitoring(void *pvParameters)
 void setup()
 {
   delay(1000);
-  Serial.begin(115200);
+  Serial.begin(921600);
   while (!Serial)
     ;
   Serial.println("\n--- Safe Servo Boot Initializing for ESP32 (Dual-Core) ---");
