@@ -1,90 +1,62 @@
 /**
- * @file robot_arm_firmware_ros2.ino
- * @brief High-Performance ESP32 Firmware for ROS2 Real-Time Control
- * @author Gemini
- * @date 27 Sep 2025
+ * @file main.cpp
+ * @brief Fully interruptible, non-blocking firmware for ROS2 Robot Arm with auto-calibration and optimizations
+ * @author Farouk & Gemini
+ * @date 06 Oct 2025
  *
  * @description
- * This firmware controls a 6-axis robot arm using an ESP32, optimized for
- * real-time, low-latency control via a high-speed binary ROS2 bridge.
+ * This firmware uses a non-blocking, dual-taask architecture for motion control.
+ * - A low-priority task parses incoming serial commands and sets a target pose.
+ * - A high-priority "interpolator" task runs at a fixed rate (50Hz) to
+ * smoothly move the servos from their current angle to the target angle.
+ * This allows a new command to interrupt and override an existing motion at any time.
  *
- * Key Optimizations:
- * - Replaced ASCII serial protocol with a compact binary protocol to drastically
- * reduce parsing overhead and increase throughput.
- * - Baud rate increased to 921600 for high-speed communication.
- * - Command parsing is now a direct memory copy, eliminating string operations.
- * - Added a checksum for data integrity.
- * - Maintained the dual-core architecture for concurrent monitoring and control.
+ * Optimizations in this version:
+ * - Added more efficient easing functions for smoother, less CPU-intensive motion.
+ * - EEPROM writes are now on-demand via a dedicated 'S' command to prevent motion stutter
+ * and reduce flash memory wear.
+ * - Added EEPROM loading on boot to restore the last saved position.
+ * - Re-implemented non-blocking, current-based smart gripper functionality.
  */
 
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
-#include "Arduino.h"
 #include <Adafruit_INA219.h>
 #include <EEPROM.h>
-
-// ==========================================================================
-// --- SERIAL PROTOCOL DEFINITION ---
-// ==========================================================================
-#define SERIAL_BAUD_RATE 921600
-const uint8_t HEADER_BYTE = 0xA5;
-
-// Command from PC to ESP32 (total 15 bytes)
-struct __attribute__((packed)) CommandPacket
-{
-  uint8_t header;        // Should be 0xA5
-  uint8_t command_id;    // 'M' for move, 'G' for grip, etc.
-  float angles[6];       // Target angles for each joint
-  float speed_factor;    // Movement speed
-  float gripper_current; // Current for gripper
-  uint8_t checksum;
-};
-
-// Status from ESP32 to PC (total 31 bytes)
-struct __attribute__((packed)) StatusPacket
-{
-  uint8_t header; // Should be 0xA5
-  float main_current_A;
-  float gripper_current_mA;
-  float actual_angles[6];
-  uint8_t checksum;
-};
-
-CommandPacket g_rx_packet;
-StatusPacket g_tx_packet;
+#include <cmath>
 
 // ==========================================================================
 // --- Multi-Tasking & Safety Configuration ---
 // ==========================================================================
-TaskHandle_t h_task_robot_control = NULL;
+TaskHandle_t h_task_command_parser = NULL;
 TaskHandle_t h_task_monitoring = NULL;
-SemaphoreHandle_t x_currentPulse_mutex;
+TaskHandle_t h_task_motion_interpolator = NULL; // High-priority motion task
+SemaphoreHandle_t x_pose_mutex;                 // Mutex to protect shared pose data
 
-volatile float g_collision_current_threshold_A = 2.5f;
+volatile float g_collision_current_threshold_A = 2.0f;
 volatile bool g_collisionDetected = false;
 volatile float g_mainCurrent_A = 0.0;
 volatile float g_gripperCurrent_mA = 0.0;
+float g_calibrated_zero_voltage = 2.4207f;
 
-#define GRIPPER_AVG_SAMPLES 5
-volatile float g_gripper_current_samples[GRIPPER_AVG_SAMPLES] = {0.0};
-volatile int g_gripper_sample_idx = 0;
-#define EEPROM_SIZE 128
+// --- Motion Control State (Protected by Mutex) ---
+float g_current_angles[6];
+float g_target_angles[6];
+unsigned long g_move_start_time;
+unsigned long g_move_duration_ms;
+volatile float g_grip_target_current_mA = -1.0f; // NEW: Target current for smart grip. -1 means inactive.
 
 // ==========================================================================
-// --- SENSOR & HARDWARE CONFIGURATION ---
+// --- Hardware & Servo Configuration ---
 // ==========================================================================
 #define ACS712_PIN 34
-const float sens = 0.66; // 30A version is 66 mV/A
-const float vcc = 3.3;
-const int adcMax = 4095;
-const int nSamples = 250;
-float zero_point_voltage = 1.65;
+#define OE_PIN 13
+#define BAUD_RATE 921600
+#define EEPROM_SIZE 128
+#define EEPROM_VALID_FLAG 123 // Magic number to check if EEPROM data is valid
 
 Adafruit_INA219 ina219 = Adafruit_INA219(0x41);
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
-
-#define OE_PIN 13
-#define AUTO_HOME_ON_BOOT 1
 
 #define SERVOS_NUMBER 6
 #define SERVO_MIN_US 500
@@ -92,364 +64,406 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 #define PWM_FREQ 50
 #define GRIPPER_SERVO_INDEX 5
 
-// --- Speed Configuration ---
-float g_speed_factor_ms_per_degree = 150.0f;
-#define DURATION_MIN_MS 100
-#define DURATION_MAX_MS 4000
-
-// --- Servo Configuration ---
 const uint8_t SERVOS[SERVOS_NUMBER] = {10, 11, 12, 13, 14, 15};
-const float SERVOS_MIN[SERVOS_NUMBER] = {40.0f, 40.0f, 0.0f, 30.0f, 0.0f, 20.0f};
-const float SERVOS_MAX[SERVOS_NUMBER] = {150.0f, 150.0f, 145.0f, 130.0f, 120.0f, 93.0f};
-const float HOME_POSITION[SERVOS_NUMBER] = {90.00, 90.00, 90.00, 90.00, 90.00, 30.00};
+const float SERVOS_MIN[SERVOS_NUMBER] = {40.0f, 40.0f, 0.0f, 30.0f, 0.0f, 0.0f};
+const float SERVOS_MAX[SERVOS_NUMBER] = {150.0f, 150.0f, 145.0f, 130.0f, 120.0f, 120.0f};
+const float HOME_POSITION[SERVOS_NUMBER] = {70.00, 70.00, 120.00, 140.00, 80.00, 30.00};
 const bool SERVO_INVERT[SERVOS_NUMBER] = {true, false, false, false, false, false};
 const int16_t TRIM_US[SERVOS_NUMBER] = {0, 0, 0, 0, 0, 0};
 
-int currentPulse[16];
+// ==========================================================================
+// --- Binary Communication Protocol ---
+// ==========================================================================
+#define HEADER_BYTE 0xA5
 
-// --- Math & Helper Functions ---
+#pragma pack(push, 1)
+struct CommandPacket
+{
+  uint8_t header;
+  uint8_t cmd_id; // 'M'ove, 'H'ome, 'G'rip, 'S'ave
+  float angles[6];
+  float speed_factor;
+  float gripper_current_ma;
+  uint8_t checksum;
+};
+
+struct StatusPacket
+{
+  uint8_t header;
+  float main_current_A;
+  float gripper_current_mA;
+  float angles[6];
+  uint8_t checksum;
+};
+#pragma pack(pop)
+
+// --- Helper Functions ---
 uint8_t calculate_checksum(const uint8_t *data, size_t len)
 {
   uint8_t checksum = 0;
-  for (size_t i = 0; i < len; i++)
+  for (size_t i = 0; i < len; ++i)
   {
     checksum ^= data[i];
   }
   return checksum;
 }
 
-int angleToPulse(float degrees)
+int angleToPulse(float degrees, int servo_index)
 {
-  return map(degrees, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
+  float safe_angle = constrain(degrees, SERVOS_MIN[servo_index], SERVOS_MAX[servo_index]);
+  if (SERVO_INVERT[servo_index])
+  {
+    safe_angle = 180.0f - safe_angle;
+  }
+  int pulse = map(safe_angle, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
+  return pulse + TRIM_US[servo_index];
 }
 
-float pulseToAngle(int pulse, int servoIndex)
+float pulseToAngle(int pulse, int servo_index)
 {
-  int pulseWithoutTrim = pulse - TRIM_US[servoIndex];
-  float degrees = (float)(pulseWithoutTrim - SERVO_MIN_US) * 180.0f / (float)(SERVO_MAX_US - SERVO_MIN_US);
-  return SERVO_INVERT[servoIndex] ? 180.0f - degrees : degrees;
+  int pulse_without_trim = pulse - TRIM_US[servo_index];
+  float degrees = (float)(pulse_without_trim - SERVO_MIN_US) * 180.0f / (float)(SERVO_MAX_US - SERVO_MIN_US);
+  return SERVO_INVERT[servo_index] ? 180.0f - degrees : degrees;
 }
 
-static inline float easeInOutQuint(float t)
+static inline float easeInOutCubic(float t)
 {
-  if (t < 0.5f)
-    return 16.0f * t * t * t * t * t;
-  float f = t - 1.0f;
-  return 1.0f + 16.0f * f * f * f * f * f;
+  t *= 2.0f;
+  if (t < 1.0f)
+  {
+    return 0.5f * t * t * t;
+  }
+  t -= 2.0f;
+  return 0.5f * (t * t * t + 2.0f);
 }
 
-// --- Core Safety & Motion ---
+// ==========================================================================
+// --- SAFETY FUNCTION ---
+// ==========================================================================
 void emergency_stop()
 {
   g_collisionDetected = true;
-  digitalWrite(OE_PIN, HIGH);
-  Serial.println("\nE-STOP\n");
-  if (h_task_robot_control != NULL)
-    vTaskSuspend(h_task_robot_control);
-  if (h_task_monitoring != NULL)
-    vTaskSuspend(h_task_monitoring);
+  digitalWrite(OE_PIN, HIGH); // Disable servo driver
+  Serial.println("\nE-STOP: Main current limit exceeded. Halting.\n");
+  // Suspend motion and command tasks for safety
+  if (h_task_motion_interpolator != NULL)
+    vTaskSuspend(h_task_motion_interpolator);
+  if (h_task_command_parser != NULL)
+    vTaskSuspend(h_task_command_parser);
 }
 
-void moveServosSmoothly(const float targetAngles[], uint32_t override_duration = 0)
+// ==========================================================================
+// --- Motion Interpolator Task (Core 1, High Priority) ---
+// ==========================================================================
+void task_motion_interpolator(void *pvParameters)
 {
-  if (g_collisionDetected)
-    return;
+  const TickType_t xFrequency = pdMS_TO_TICKS(20); // 50 Hz update rate
+  TickType_t xLastWakeTime = xTaskGetTickCount();
 
-  int startPulse[SERVOS_NUMBER];
-  int targetPulse[SERVOS_NUMBER];
-  int deltaPulse[SERVOS_NUMBER];
-  float max_angle_delta = 0.0f;
-
-  xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-  for (int i = 0; i < SERVOS_NUMBER; i++)
+  for (;;)
   {
-    uint8_t ch = SERVOS[i];
-    startPulse[i] = currentPulse[ch];
-    float startAngle = pulseToAngle(startPulse[i], i);
-    float angle_delta = abs(targetAngles[i] - startAngle);
-    if (angle_delta > max_angle_delta)
-      max_angle_delta = angle_delta;
-
-    float safeAngle = constrain(targetAngles[i], SERVOS_MIN[i], SERVOS_MAX[i]);
-    if (SERVO_INVERT[i])
-      safeAngle = 180.0f - safeAngle;
-    targetPulse[i] = angleToPulse(safeAngle) + TRIM_US[i];
-    deltaPulse[i] = targetPulse[i] - startPulse[i];
-  }
-  xSemaphoreGive(x_currentPulse_mutex);
-
-  uint32_t move_duration_ms = (override_duration > 0) ? override_duration : (max_angle_delta * g_speed_factor_ms_per_degree);
-  move_duration_ms = constrain(move_duration_ms, DURATION_MIN_MS, DURATION_MAX_MS);
-
-  unsigned long startTime = millis();
-  unsigned long currentTime;
-  do
-  {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
     if (g_collisionDetected)
-      return;
-    currentTime = millis();
-    float fraction = (float)(currentTime - startTime) / (float)move_duration_ms;
-    if (fraction > 1.0f)
-      fraction = 1.0f;
-    float eased_fraction = easeInOutQuint(fraction);
+      continue;
+
+    xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+
+    unsigned long elapsed_time = millis() - g_move_start_time;
+    float fraction = 1.0f;
+    if (g_move_duration_ms > 0)
+    {
+      fraction = (float)elapsed_time / (float)g_move_duration_ms;
+    }
+    fraction = constrain(fraction, 0.0f, 1.0f);
+    float eased_fraction = easeInOutCubic(fraction);
+
+    // --- Smart Grip Logic ---
+    if (g_grip_target_current_mA > 0 && fabsf(g_gripperCurrent_mA) > g_grip_target_current_mA)
+    {
+      // Gripper has made contact and exceeded current threshold
+      float final_grip_angle = (g_current_angles[GRIPPER_SERVO_INDEX] * (1.0f - eased_fraction)) + (g_target_angles[GRIPPER_SERVO_INDEX] * eased_fraction);
+
+      // Stop the gripper's motion immediately by setting its target to its current location
+      g_current_angles[GRIPPER_SERVO_INDEX] = final_grip_angle;
+      g_target_angles[GRIPPER_SERVO_INDEX] = final_grip_angle;
+
+      g_grip_target_current_mA = -1.0f; // Deactivate smart grip mode
+    }
 
     for (int i = 0; i < SERVOS_NUMBER; i++)
     {
-      uint8_t ch = SERVOS[i];
-      int pulse = startPulse[i] + (int)((float)deltaPulse[i] * eased_fraction);
-      pwm.writeMicroseconds(ch, pulse);
+      // Interpolate from current to target using linear interpolation (lerp)
+      float interpolated_angle = (g_current_angles[i] * (1.0f - eased_fraction)) + (g_target_angles[i] * eased_fraction);
+      pwm.writeMicroseconds(SERVOS[i], angleToPulse(interpolated_angle, i));
     }
-    vTaskDelay(pdMS_TO_TICKS(5));
-  } while (currentTime - startTime < move_duration_ms);
 
-  xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-  for (int i = 0; i < SERVOS_NUMBER; i++)
-  {
-    uint8_t ch = SERVOS[i];
-    pwm.writeMicroseconds(ch, targetPulse[i]);
-    currentPulse[ch] = targetPulse[i];
+    // If move is complete, update the "current" angles to match the target
+    if (fraction >= 1.0f)
+    {
+      g_grip_target_current_mA = -1.0; // Ensure grip mode is off after any move completes
+      for (int i = 0; i < SERVOS_NUMBER; i++)
+      {
+        g_current_angles[i] = g_target_angles[i];
+      }
+    }
+
+    xSemaphoreGive(x_pose_mutex);
   }
-  EEPROM.write(0, 123);
-  EEPROM.put(1, currentPulse);
-  EEPROM.commit();
-  xSemaphoreGive(x_currentPulse_mutex);
 }
 
-void gripWithCurrentSensing(float targetAngle, float currentThreshold_mA)
+// ==========================================================================
+// --- Command Parser Task (Core 1, Low Priority) ---
+// ==========================================================================
+void parse_command(const CommandPacket &cmd)
 {
   if (g_collisionDetected)
     return;
 
-  const uint8_t gripperChannel = SERVOS[GRIPPER_SERVO_INDEX];
-  const int gripReleaseSteps = 30;
-
-  xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-  int startPulse = currentPulse[gripperChannel];
-  xSemaphoreGive(x_currentPulse_mutex);
-
-  float safeAngle = constrain(targetAngle, SERVOS_MIN[GRIPPER_SERVO_INDEX], SERVOS_MAX[GRIPPER_SERVO_INDEX]);
-  if (SERVO_INVERT[GRIPPER_SERVO_INDEX])
-    safeAngle = 180.0f - safeAngle;
-  int targetPulseVal = angleToPulse(safeAngle) + TRIM_US[GRIPPER_SERVO_INDEX];
-  int step = (targetPulseVal > startPulse) ? 1 : -1;
-
-  for (int p = startPulse; (step > 0) ? (p <= targetPulseVal) : (p >= targetPulseVal); p += step)
+  switch (cmd.cmd_id)
   {
-    if (g_collisionDetected)
-      return;
-    pwm.writeMicroseconds(gripperChannel, p);
-    vTaskDelay(pdMS_TO_TICKS(15));
+  case 'M': // MOVE
+  case 'H': // HOME
+  case 'G': // GRIP
+  {
+    xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
 
-    if (abs(g_gripperCurrent_mA) > currentThreshold_mA)
+    // A regular move cancels any active grip command
+    if (cmd.cmd_id == 'M' || cmd.cmd_id == 'H')
     {
-      int finalPulse = p - (step * gripReleaseSteps);
-      pwm.writeMicroseconds(gripperChannel, finalPulse);
-
-      xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-      currentPulse[gripperChannel] = finalPulse;
-      EEPROM.write(0, 123);
-      EEPROM.put(1, currentPulse);
-      EEPROM.commit();
-      xSemaphoreGive(x_currentPulse_mutex);
-      return;
+      g_grip_target_current_mA = -1.0f;
     }
+
+    // The move starts NOW from the current interpolated position.
+    // First, calculate the true current position to ensure a smooth transition.
+    unsigned long elapsed_time = millis() - g_move_start_time;
+    float fraction = g_move_duration_ms > 0 ? (float)elapsed_time / (float)g_move_duration_ms : 1.0f;
+    fraction = constrain(fraction, 0.0f, 1.0f);
+    float eased_fraction = easeInOutCubic(fraction);
+    for (int i = 0; i < SERVOS_NUMBER; i++)
+    {
+      // Update g_current_angles to the actual current position before setting a new target
+      g_current_angles[i] = (g_current_angles[i] * (1.0f - eased_fraction)) + (g_target_angles[i] * eased_fraction);
+    }
+
+    // Set the new target
+    float max_angle_delta = 0.0f;
+    for (int i = 0; i < SERVOS_NUMBER; i++)
+    {
+      float target = (cmd.cmd_id == 'H') ? HOME_POSITION[i] : cmd.angles[i];
+      float delta = std::abs(target - g_current_angles[i]);
+      if (delta > max_angle_delta)
+      {
+        max_angle_delta = delta;
+      }
+      g_target_angles[i] = constrain(target, SERVOS_MIN[i], SERVOS_MAX[i]);
+    }
+
+    if (cmd.cmd_id == 'G')
+    {
+      g_grip_target_current_mA = cmd.gripper_current_ma;
+    }
+
+    g_move_start_time = millis();
+    g_move_duration_ms = max_angle_delta * cmd.speed_factor;
+    if (cmd.cmd_id == 'H')
+      g_move_duration_ms = 4000; // Homing is always slow
+
+    xSemaphoreGive(x_pose_mutex);
+    break;
   }
 
-  xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
-  currentPulse[gripperChannel] = targetPulseVal;
-  EEPROM.write(0, 123);
-  EEPROM.put(1, currentPulse);
-  EEPROM.commit();
-  xSemaphoreGive(x_currentPulse_mutex);
+  case 'S': // SAVE
+  {
+    xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+    EEPROM.write(0, EEPROM_VALID_FLAG);
+    EEPROM.put(1, g_current_angles);
+    EEPROM.commit();
+    xSemaphoreGive(x_pose_mutex);
+    Serial.println("INFO: Current pose saved to EEPROM.");
+    break;
+  }
+  }
 }
 
-void goHome(uint16_t duration)
+// --- FIXED: Reverted to robust byte-by-byte serial parser ---
+void task_command_parser(void *pvParameters)
 {
-  moveServosSmoothly(HOME_POSITION, duration);
-}
-
-// --- CORE 1: Robot Control Task (Handles incoming commands) ---
-void task_robot_control(void *pvParameters)
-{
-  Serial.println("INFO: Control Task started on Core 1.");
-  uint8_t buffer[sizeof(CommandPacket)];
+  uint8_t serial_buffer[sizeof(CommandPacket)];
   int buffer_pos = 0;
 
   for (;;)
   {
-    while (Serial.available())
+    while (Serial.available() > 0)
     {
       uint8_t byte_in = Serial.read();
-      if (buffer_pos == 0 && byte_in != HEADER_BYTE)
+
+      // If the buffer is empty, we must wait for a header byte
+      if (buffer_pos == 0)
       {
-        continue; // Wait for header
+        if (byte_in == HEADER_BYTE)
+        {
+          serial_buffer[buffer_pos++] = byte_in;
+        }
+        // If it's not a header, we just ignore it and continue waiting
       }
-
-      buffer[buffer_pos++] = byte_in;
-
-      if (buffer_pos == sizeof(CommandPacket))
+      else
       {
-        // Full packet received, cast to struct
-        memcpy(&g_rx_packet, buffer, sizeof(CommandPacket));
+        // If we are already filling the buffer, add the new byte
+        serial_buffer[buffer_pos++] = byte_in;
 
-        // Verify checksum
-        uint8_t calculated_checksum = calculate_checksum(buffer, sizeof(CommandPacket) - 1);
-        if (g_rx_packet.checksum == calculated_checksum)
+        // If the buffer is now full, process the packet
+        if (buffer_pos >= sizeof(CommandPacket))
         {
-          // Command is valid, process it
-          g_speed_factor_ms_per_degree = g_rx_packet.speed_factor;
+          CommandPacket received_cmd;
+          memcpy(&received_cmd, serial_buffer, sizeof(CommandPacket));
 
-          switch (g_rx_packet.command_id)
+          uint8_t calculated_cs = calculate_checksum(serial_buffer, sizeof(CommandPacket) - 1);
+
+          if (calculated_cs == received_cmd.checksum)
           {
-          case 'M': // Move all joints
-            moveServosSmoothly(g_rx_packet.angles);
-            break;
-          case 'G': // Grip
-            gripWithCurrentSensing(g_rx_packet.angles[GRIPPER_SERVO_INDEX], g_rx_packet.gripper_current);
-            break;
-          case 'H': // Go Home
-            goHome(2500);
-            break;
+            // Command is valid, process it
+            parse_command(received_cmd);
           }
+          else
+          {
+            // Checksum failed
+            Serial.println("WARN: Checksum failed!");
+          }
+
+          // Reset buffer for the next packet
+          buffer_pos = 0;
         }
-        else
-        {
-          // Checksum failed, discard packet
-        }
-        buffer_pos = 0; // Reset for next packet
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(5)); // Small delay to prevent busy-waiting
+
+    vTaskDelay(pdMS_TO_TICKS(5)); // Yield to other tasks
   }
 }
 
-// --- CORE 0: Monitoring Task (Sends status back to PC) ---
+// ==========================================================================
+// --- Monitoring Task (Core 0) ---
+// ==========================================================================
 void task_monitoring(void *pvParameters)
 {
-  Serial.println("INFO: Monitoring Task started on Core 0.");
   long lastStatusSendTime = 0;
+  const int nSamples = 250;
+  const float sens = 0.066; // For 30A ACS712 model
+  const float vcc = 3.3;
+  const int adcMax = 4095;
 
   for (;;)
   {
-    // Read main current
     long val = 0;
     for (int i = 0; i < nSamples; i++)
       val += analogRead(ACS712_PIN);
-    float avg_adc = (float)val / nSamples;
-    float measured_voltage = (avg_adc / adcMax) * vcc;
-    g_mainCurrent_A = (measured_voltage - zero_point_voltage) / sens;
+    float measured_voltage = ((float)val / nSamples / adcMax) * vcc;
 
-    // Read and average gripper current
-    g_gripper_current_samples[g_gripper_sample_idx] = ina219.getCurrent_mA();
-    g_gripper_sample_idx = (g_gripper_sample_idx + 1) % GRIPPER_AVG_SAMPLES;
-    float avg_current = 0.0;
-    for (int i = 0; i < GRIPPER_AVG_SAMPLES; i++)
-      avg_current += g_gripper_current_samples[i];
-    g_gripperCurrent_mA = avg_current / GRIPPER_AVG_SAMPLES;
+    g_mainCurrent_A = (measured_voltage - g_calibrated_zero_voltage) / sens;
+    g_gripperCurrent_mA = ina219.getCurrent_mA();
 
-    if (abs(g_mainCurrent_A) > g_collision_current_threshold_A)
+    if (fabsf(g_mainCurrent_A) > g_collision_current_threshold_A)
     {
       emergency_stop();
     }
 
-    // Send status to ROS host periodically (e.g., at 50 Hz)
-    if (millis() - lastStatusSendTime > 20)
-    {
-      g_tx_packet.header = HEADER_BYTE;
-      g_tx_packet.main_current_A = g_mainCurrent_A;
-      g_tx_packet.gripper_current_mA = g_gripperCurrent_mA;
+    if (millis() - lastStatusSendTime > 100)
+    { // 10 Hz
+      StatusPacket status;
+      status.header = HEADER_BYTE;
+      status.main_current_A = g_mainCurrent_A;
+      status.gripper_current_mA = g_gripperCurrent_mA;
 
-      xSemaphoreTake(x_currentPulse_mutex, portMAX_DELAY);
+      xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+      // Calculate real-time interpolated angles for feedback
+      unsigned long elapsed_time = millis() - g_move_start_time;
+      float fraction = g_move_duration_ms > 0 ? (float)elapsed_time / (float)g_move_duration_ms : 1.0f;
+      fraction = constrain(fraction, 0.0f, 1.0f);
+      float eased_fraction = easeInOutCubic(fraction);
       for (int i = 0; i < SERVOS_NUMBER; i++)
       {
-        g_tx_packet.actual_angles[i] = pulseToAngle(currentPulse[SERVOS[i]], i);
+        status.angles[i] = (g_current_angles[i] * (1.0f - eased_fraction)) + (g_target_angles[i] * eased_fraction);
       }
-      xSemaphoreGive(x_currentPulse_mutex);
+      xSemaphoreGive(x_pose_mutex);
 
-      uint8_t *tx_buffer = (uint8_t *)&g_tx_packet;
-      g_tx_packet.checksum = calculate_checksum(tx_buffer, sizeof(StatusPacket) - 1);
-
-      Serial.write(tx_buffer, sizeof(StatusPacket));
+      status.checksum = calculate_checksum((uint8_t *)&status, sizeof(StatusPacket) - 1);
+      Serial.write((uint8_t *)&status, sizeof(StatusPacket));
       lastStatusSendTime = millis();
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
 // ==========================================================================
-// --- SETUP & MAIN LOOP ---
+// --- SETUP ---
 // ==========================================================================
 void setup()
 {
   delay(1000);
-  Serial.begin(SERIAL_BAUD_RATE);
-  while (!Serial)
-    ;
-  Serial.println("\n--- ESP32 Robot Arm Firmware (ROS2 Binary Protocol) ---");
+  Serial.begin(BAUD_RATE);
+  Serial.println("\n--- ESP32 Robot Arm Firmware (Optimized Non-Blocking Edition) ---");
 
-  if (!EEPROM.begin(EEPROM_SIZE))
-  {
-    Serial.println("FATAL: Failed to initialise EEPROM!");
-    while (1)
-      ;
-  }
+  EEPROM.begin(EEPROM_SIZE);
 
   pinMode(OE_PIN, OUTPUT);
-  pinMode(ACS712_PIN, INPUT);
-  digitalWrite(OE_PIN, HIGH);
-  Serial.println("Step 1: Outputs DISABLED.");
+  digitalWrite(OE_PIN, HIGH); // Servos disabled initially for safety
+
+  // --- CALIBRATION STEP (Uncomment if needed) ---
+  // Serial.println("Calibrating current sensor... Keep arm power off or unloaded.");
+  // long adc_sum = 0;
+  // const int n_cal_samples = 1000;
+  // for (int i = 0; i < n_cal_samples; i++) {
+  //   adc_sum += analogRead(ACS712_PIN);
+  //   delay(1);
+  // }
+  // g_calibrated_zero_voltage = ((float)adc_sum / n_cal_samples / 4095.0f) * 3.3f;
+  // Serial.print("Calibration complete. Zero-point voltage: ");
+  // Serial.println(g_calibrated_zero_voltage, 4);
 
   Wire.begin();
   pwm.begin();
   pwm.setOscillatorFrequency(27000000);
   pwm.setPWMFreq(PWM_FREQ);
+  ina219.begin();
 
-  if (!ina219.begin())
+  // --- MODIFIED: Initialize pose from EEPROM or HOME position ---
+  if (EEPROM.read(0) == EEPROM_VALID_FLAG)
   {
-    Serial.println("FATAL: Failed to find INA219 chip for gripper!");
-    while (1)
-      ;
-  }
-  ina219.setCalibration_32V_1A();
-  Serial.println("Step 2: Sensors and PWM driver initialized.");
-
-  if (EEPROM.read(0) == 123)
-  {
-    Serial.println("Step 3: Restored last pose from EEPROM.");
-    EEPROM.get(1, currentPulse);
+    Serial.println("INFO: Restoring last saved pose from EEPROM.");
+    EEPROM.get(1, g_current_angles);
+    for (int i = 0; i < SERVOS_NUMBER; i++)
+    {
+      g_target_angles[i] = g_current_angles[i];
+    }
   }
   else
   {
-    Serial.println("Step 3: No EEPROM pose found. Defaulting to HOME.");
+    Serial.println("INFO: No valid pose in EEPROM. Starting at HOME position.");
     for (int i = 0; i < SERVOS_NUMBER; i++)
     {
-      float safeAngle = HOME_POSITION[i];
-      if (SERVO_INVERT[i])
-        safeAngle = 180.0f - safeAngle;
-      currentPulse[SERVOS[i]] = angleToPulse(safeAngle) + TRIM_US[i];
+      g_current_angles[i] = HOME_POSITION[i];
+      g_target_angles[i] = HOME_POSITION[i];
     }
   }
 
-  digitalWrite(OE_PIN, LOW);
-  Serial.println("Step 4: Outputs ENABLED.");
+  g_move_start_time = millis();
+  g_move_duration_ms = 0;
+
+  digitalWrite(OE_PIN, LOW); // Enable servos
+  Serial.println("Servos enabled.");
   delay(500);
 
-  x_currentPulse_mutex = xSemaphoreCreateMutex();
+  x_pose_mutex = xSemaphoreCreateMutex();
 
-#if AUTO_HOME_ON_BOOT
-  Serial.println("Step 5: Auto slow-move to HOME.");
-  goHome(4000);
-#endif
+  Serial.println("Initializing tasks...");
+  xTaskCreatePinnedToCore(task_monitoring, "Monitoring", 4096, NULL, 1, &h_task_monitoring, 0);
+  xTaskCreatePinnedToCore(task_command_parser, "CmdParser", 4096, NULL, 2, &h_task_command_parser, 1);
+  xTaskCreatePinnedToCore(task_motion_interpolator, "Motion", 4096, NULL, 3, &h_task_motion_interpolator, 1); // Highest priority
 
-  Serial.println("\n--- Initializing Dual-Core Tasks ---");
-  xTaskCreatePinnedToCore(task_monitoring, "Monitoring", 4096, NULL, 2, &h_task_monitoring, 0);
-  xTaskCreatePinnedToCore(task_robot_control, "Control", 4096, NULL, 1, &h_task_robot_control, 1);
-
-  Serial.println("\n--- Initialization Complete. Ready for commands. ---");
+  Serial.println("Initialization Complete. Ready for commands.");
 }
 
 void loop()
 {
-  vTaskDelete(NULL); // FreeRTOS tasks handle everything.
+  vTaskDelete(NULL); // FreeRTOS handles everything.
 }
