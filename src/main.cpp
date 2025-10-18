@@ -33,11 +33,11 @@ TaskHandle_t h_task_monitoring = NULL;
 TaskHandle_t h_task_motion_interpolator = NULL; // High-priority motion task
 SemaphoreHandle_t x_pose_mutex;                 // Mutex to protect shared pose data
 
-volatile float g_collision_current_threshold_A = 2.0f;
+volatile float g_collision_current_threshold_A = 2.5f;
 volatile bool g_collisionDetected = false;
 volatile float g_mainCurrent_A = 0.0;
 volatile float g_gripperCurrent_mA = 0.0;
-float g_calibrated_zero_voltage = 2.4207f;
+float g_calibrated_zero_voltage = 2.4038f;
 
 // --- Motion Control State (Protected by Mutex) ---
 float g_current_angles[6];
@@ -364,9 +364,10 @@ void task_monitoring(void *pvParameters)
     if (fabsf(g_mainCurrent_A) > g_collision_current_threshold_A)
     {
       emergency_stop();
+      continue;
     }
 
-    if (millis() - lastStatusSendTime > 100)
+    if (millis() - lastStatusSendTime > 100 && !g_collisionDetected)
     { // 10 Hz
       StatusPacket status;
       status.header = HEADER_BYTE;
@@ -399,7 +400,7 @@ void task_monitoring(void *pvParameters)
 // ==========================================================================
 void setup()
 {
-  delay(1000);
+  delay(4000);
   Serial.begin(BAUD_RATE);
   Serial.println("\n--- ESP32 Robot Arm Firmware (Optimized Non-Blocking Edition) ---");
 
@@ -412,7 +413,8 @@ void setup()
   // Serial.println("Calibrating current sensor... Keep arm power off or unloaded.");
   // long adc_sum = 0;
   // const int n_cal_samples = 1000;
-  // for (int i = 0; i < n_cal_samples; i++) {
+  // for (int i = 0; i < n_cal_samples; i++)
+  // {
   //   adc_sum += analogRead(ACS712_PIN);
   //   delay(1);
   // }
