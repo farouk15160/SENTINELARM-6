@@ -1,7 +1,7 @@
 /**
  * @file main.cpp
  * @brief Fully interruptible, non-blocking firmware for ROS2 Robot Arm with auto-calibration and optimizations
- * @author Farouk & Gemini
+ * @author Farouk
  * @date 19 Oct 2025
  *
  * @description
