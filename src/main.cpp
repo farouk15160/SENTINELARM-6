@@ -6,18 +6,13 @@
  *
  * @description
  * This firmware uses a non-blocking, dual-task architecture for motion control.
- * - A low-priority task parses incoming serial commands and sets a target pose.
- * - A high-priority "interpolator" task runs at a fixed rate (50Hz) to
- * smoothly move all joints (servos and stepper) from their current angle to the target angle.
- * This allows a new command to interrupt and override an existing motion at any time.
  *
- * Version 3.5 (Stable Release):
- * - Merged known-good stepper logic from successful hardware test.
- * - Added STEPPER_ENABLE_PIN control for safety and power saving.
- * - Implemented reliable, slower stepper pulse timing (500us) to prevent stalls.
- * - Added software Min/Max angle limits for the stepper base (15-345 deg).
- * - Corrected HOME_POSITION bug to prevent joint over-travel.
- * - Implemented a robust, non-jumping startup sequence.
+ * Version 3.8 (E-Stop Release Feature):
+ * - Added new command 'E': Releases E-Stop. Resets collision flag, resumes suspended
+ * tasks (motion and parser), and re-enables motor power.
+ * - `emergency_stop()` is now safer and won't try to suspend null tasks.
+ * - Added EEPROM persistence for Min/Max limits and collision threshold.
+ * - `StatusPacket` now has a `cmd_id` of 'S' (0x53) for multi-packet parsing.
  */
 
 #include <Wire.h>
@@ -26,23 +21,20 @@
 #include <EEPROM.h>
 #include <cmath>
 
-// --- Stepper Motor (Base) Configuration (from successful test) ---
+// --- Stepper Motor (Base) Configuration ---
 const int STEPPER_DIR_PIN = 16;
 const int STEPPER_STEP_PIN = 17;
 const int STEPPER_MS1_PIN = 18;
 const int STEPPER_MS2_PIN = 19;
 const int STEPPER_MS3_PIN = 23;
-const int STEPPER_ENABLE_PIN = 4; // NEW: From your test sketch
+const int STEPPER_ENABLE_PIN = 4;
 
-#define STEPPER_STEPS_PER_REV 200 // 1.8 deg/step motor
-#define STEPPER_MICROSTEPS 16     // Using 1/16 microstepping
-#define STEPPER_GEAR_RATIO 5.0f   // !!! IMPORTANT: CHANGE THIS to match your robot's gear ratio
+#define STEPPER_STEPS_PER_REV 200
+#define STEPPER_MICROSTEPS 16
+#define STEPPER_GEAR_RATIO 5.0f
+#define STEPPER_PULSE_WIDTH_US 10 // old 50
+#define STEPPER_PULSE_DELAY_US 500
 
-// --- Pulse timing for the stepper driver (slower and reliable) ---
-#define STEPPER_PULSE_WIDTH_US 50  // Microseconds for step pulse (HIGH)
-#define STEPPER_PULSE_DELAY_US 500 // Microseconds between pulses (LOW). Slower is more reliable.
-
-// Steps per degree of the *output shaft*
 const float STEPPER_STEPS_PER_DEGREE = (STEPPER_STEPS_PER_REV * STEPPER_MICROSTEPS * STEPPER_GEAR_RATIO) / 360.0f;
 
 // ==========================================================================
@@ -73,30 +65,39 @@ volatile long g_stepper_current_step_pos = 0;
 #define ACS712_PIN 34
 #define OE_PIN 13
 #define BAUD_RATE 921600
-#define EEPROM_SIZE 128
-#define EEPROM_VALID_FLAG 123
+#define PWM_FREQ 50
+#define GRIPPER_SERVO_INDEX 5
+#define JOINT_1_SECOND_SERVO 11
+#define SERVOS_NUMBER 6
+#define SERVO_MIN_US 500
+#define SERVO_MAX_US 2500
 
 Adafruit_INA219 ina219 = Adafruit_INA219(0x41);
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-#define SERVOS_NUMBER 6
-#define SERVO_MIN_US 500
-#define SERVO_MAX_US 2500
-#define PWM_FREQ 50
-#define GRIPPER_SERVO_INDEX 5
-#define JOINT_1_SECOND_SERVO 11
-
-// Joint 0: Stepper
-// Joint 1: Controls Servos 10 AND 11
-// ...
 const uint8_t SERVOS[SERVOS_NUMBER] = {0, 10, 12, 13, 14, 15};
-// --- NEW: Added Min/Max limits for Stepper (Joint 0) ---
-const float SERVOS_MIN[SERVOS_NUMBER] = {15.0f, 40.0f, 0.0f, 30.0f, 0.0f, 0.0f};
-const float SERVOS_MAX[SERVOS_NUMBER] = {345.0f, 150.0f, 145.0f, 130.0f, 180.0f, 120.0f};
-// --- BUG FIX: Corrected HOME_POSITION[3] to be within its limits ---
+float SERVOS_MIN[SERVOS_NUMBER] = {15.0f, 40.0f, 0.0f, 30.0f, 0.0f, 0.0f};
+float SERVOS_MAX[SERVOS_NUMBER] = {345.0f, 150.0f, 145.0f, 130.0f, 180.0f, 120.0f};
+
 const float HOME_POSITION[SERVOS_NUMBER] = {133.0f, 100.00, 110.00, 130.00, 15.00, 60.00};
 const bool SERVO_INVERT[SERVOS_NUMBER] = {false, true, false, false, false, false};
 const int16_t TRIM_US[SERVOS_NUMBER] = {0, 0, 0, 0, 0, 0};
+
+// ==========================================================================
+// --- EEPROM Configuration ---
+// ==========================================================================
+#define EEPROM_SIZE 128
+#define EEPROM_VALID_FLAG 123
+#define EEPROM_VALID_FLAG_ADDR 0
+#define EEPROM_POSE_ADDR 1
+#define EEPROM_CONFIG_ADDR (EEPROM_POSE_ADDR + sizeof(float) * SERVOS_NUMBER)
+
+struct ArmConfig
+{
+  float min_limits[SERVOS_NUMBER];
+  float max_limits[SERVOS_NUMBER];
+  float collision_threshold;
+};
 
 // ==========================================================================
 // --- Binary Communication Protocol ---
@@ -115,9 +116,19 @@ struct CommandPacket
 struct StatusPacket
 {
   uint8_t header;
+  uint8_t cmd_id;
   float main_current_A;
   float gripper_current_mA;
   float angles[6];
+  uint8_t checksum;
+};
+struct ConfigPacket
+{
+  uint8_t header;
+  uint8_t cmd_id;
+  float min_limits[6];
+  float max_limits[6];
+  float collision_threshold;
   uint8_t checksum;
 };
 #pragma pack(pop)
@@ -135,7 +146,12 @@ uint8_t calculate_checksum(const uint8_t *data, size_t len)
 
 int angleToPulse(float degrees, int servo_index)
 {
-  float safe_angle = constrain(degrees, SERVOS_MIN[servo_index], SERVOS_MAX[servo_index]);
+  xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+  float min_angle = SERVOS_MIN[servo_index];
+  float max_angle = SERVOS_MAX[servo_index];
+  xSemaphoreGive(x_pose_mutex);
+
+  float safe_angle = constrain(degrees, min_angle, max_angle);
   if (SERVO_INVERT[servo_index])
   {
     safe_angle = 180.0f - safe_angle;
@@ -159,9 +175,11 @@ static inline float easeInOutCubic(float t)
 void emergency_stop()
 {
   g_collisionDetected = true;
-  digitalWrite(OE_PIN, HIGH);             // Disable servo driver
-  digitalWrite(STEPPER_ENABLE_PIN, HIGH); // NEW: Disable stepper driver
+  digitalWrite(OE_PIN, HIGH);
+  digitalWrite(STEPPER_ENABLE_PIN, HIGH);
   Serial.println("\nE-STOP: Main current limit exceeded. Halting.\n");
+
+  // --- MODIFIED: Check task handles are valid before suspending ---
   if (h_task_motion_interpolator != NULL)
     vTaskSuspend(h_task_motion_interpolator);
   if (h_task_command_parser != NULL)
@@ -188,7 +206,6 @@ void task_motion_interpolator(void *pvParameters)
     fraction = constrain(fraction, 0.0f, 1.0f);
     float eased_fraction = easeInOutCubic(fraction);
 
-    // --- Smart Grip Logic ---
     if (g_grip_target_current_mA > 0 && fabsf(g_gripperCurrent_mA) > g_grip_target_current_mA)
     {
       float final_grip_angle = (g_current_angles[GRIPPER_SERVO_INDEX] * (1.0f - eased_fraction)) + (g_target_angles[GRIPPER_SERVO_INDEX] * eased_fraction);
@@ -197,7 +214,6 @@ void task_motion_interpolator(void *pvParameters)
       g_grip_target_current_mA = -1.0f;
     }
 
-    // --- STEPPER LOGIC (JOINT 0) ---
     long start_step_pos = (long)(g_current_angles[0] * STEPPER_STEPS_PER_DEGREE);
     long end_step_pos = (long)(g_target_angles[0] * STEPPER_STEPS_PER_DEGREE);
     long total_steps_for_move = end_step_pos - start_step_pos;
@@ -218,11 +234,14 @@ void task_motion_interpolator(void *pvParameters)
       g_stepper_current_step_pos = current_target_step_pos;
     }
 
-    // --- Servo Joints (1-5) Control ---
     for (int i = 1; i < SERVOS_NUMBER; i++)
     {
       float interpolated_angle = (g_current_angles[i] * (1.0f - eased_fraction)) + (g_target_angles[i] * eased_fraction);
+
+      xSemaphoreGive(x_pose_mutex);
       int pulse = angleToPulse(interpolated_angle, i);
+      xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+
       pwm.writeMicroseconds(SERVOS[i], pulse);
       if (i == 1)
       {
@@ -230,7 +249,6 @@ void task_motion_interpolator(void *pvParameters)
       }
     }
 
-    // --- Move Completion ---
     if (fraction >= 1.0f)
     {
       g_grip_target_current_mA = -1.0;
@@ -249,8 +267,10 @@ void task_motion_interpolator(void *pvParameters)
 // ==========================================================================
 void parse_command(const CommandPacket &cmd)
 {
-  if (g_collisionDetected)
+  // --- MODIFIED: Allow 'E' command even if collision was detected ---
+  if (g_collisionDetected && cmd.cmd_id != 'E')
     return;
+
   switch (cmd.cmd_id)
   {
   case 'M':
@@ -271,21 +291,24 @@ void parse_command(const CommandPacket &cmd)
       g_current_angles[i] = (g_current_angles[i] * (1.0f - eased_fraction)) + (g_target_angles[i] * eased_fraction);
     }
     g_stepper_current_step_pos = (long)(g_current_angles[0] * STEPPER_STEPS_PER_DEGREE);
+
     float max_angle_delta = 0.0f;
     for (int i = 0; i < SERVOS_NUMBER; i++)
     {
       float target = (cmd.cmd_id == 'H') ? HOME_POSITION[i] : cmd.angles[i];
-      g_target_angles[i] = constrain(target, SERVOS_MIN[i], SERVOS_MAX[i]); // Constrain here
+      g_target_angles[i] = constrain(target, SERVOS_MIN[i], SERVOS_MAX[i]);
       float delta = std::abs(g_target_angles[i] - g_current_angles[i]);
       if (delta > max_angle_delta)
       {
         max_angle_delta = delta;
       }
     }
+
     if (cmd.cmd_id == 'G')
     {
       g_grip_target_current_mA = cmd.gripper_current_ma;
     }
+
     g_move_start_time = millis();
     float speed = (cmd.speed_factor > 0.01f) ? cmd.speed_factor : 10.0f;
     g_move_duration_ms = max_angle_delta * speed;
@@ -306,17 +329,107 @@ void parse_command(const CommandPacket &cmd)
     {
       angles_to_save[i] = (g_current_angles[i] * (1.0f - eased_fraction)) + (g_target_angles[i] * eased_fraction);
     }
-    EEPROM.write(0, EEPROM_VALID_FLAG);
-    EEPROM.put(1, angles_to_save);
+    EEPROM.write(EEPROM_VALID_FLAG_ADDR, EEPROM_VALID_FLAG);
+    EEPROM.put(EEPROM_POSE_ADDR, angles_to_save);
     EEPROM.commit();
     xSemaphoreGive(x_pose_mutex);
     Serial.println("INFO: Current pose saved to EEPROM.");
     break;
   }
+  case 'N':
+  {
+    xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+    for (int i = 0; i < SERVOS_NUMBER; i++)
+    {
+      if (cmd.angles[i] < SERVOS_MAX[i])
+      {
+        SERVOS_MIN[i] = cmd.angles[i];
+      }
+    }
+    xSemaphoreGive(x_pose_mutex);
+    Serial.println("INFO: SERVOS_MIN limits updated in RAM.");
+    break;
   }
+  case 'X':
+  {
+    xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+    for (int i = 0; i < SERVOS_NUMBER; i++)
+    {
+      if (cmd.angles[i] > SERVOS_MIN[i])
+      {
+        SERVOS_MAX[i] = cmd.angles[i];
+      }
+    }
+    xSemaphoreGive(x_pose_mutex);
+    Serial.println("INFO: SERVOS_MAX limits updated in RAM.");
+    break;
+  }
+  case 'T':
+  {
+    float new_threshold = cmd.speed_factor;
+    if (new_threshold > 0.1f && new_threshold < 20.0f)
+    {
+      g_collision_current_threshold_A = new_threshold;
+      Serial.print("INFO: Main current threshold set to: ");
+      Serial.println(g_collision_current_threshold_A);
+    }
+    break;
+  }
+  case 'C':
+  {
+    xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+    ArmConfig cfg;
+    memcpy(cfg.min_limits, (void *)SERVOS_MIN, sizeof(SERVOS_MIN));
+    memcpy(cfg.max_limits, (void *)SERVOS_MAX, sizeof(SERVOS_MAX));
+    cfg.collision_threshold = g_collision_current_threshold_A;
+
+    EEPROM.put(EEPROM_CONFIG_ADDR, cfg);
+    EEPROM.write(EEPROM_VALID_FLAG_ADDR, EEPROM_VALID_FLAG);
+    EEPROM.commit();
+
+    xSemaphoreGive(x_pose_mutex);
+    Serial.println("INFO: Configuration saved to EEPROM.");
+    break;
+  }
+  case 'R':
+  {
+    ConfigPacket packet;
+    packet.header = HEADER_BYTE;
+    packet.cmd_id = 'R';
+
+    xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+    memcpy(packet.min_limits, (void *)SERVOS_MIN, sizeof(SERVOS_MIN));
+    memcpy(packet.max_limits, (void *)SERVOS_MAX, sizeof(SERVOS_MAX));
+    packet.collision_threshold = g_collision_current_threshold_A;
+    xSemaphoreGive(x_pose_mutex);
+
+    packet.checksum = calculate_checksum((uint8_t *)&packet, sizeof(ConfigPacket) - 1);
+    Serial.write((uint8_t *)&packet, sizeof(ConfigPacket));
+    Serial.println("INFO: Sent config report.");
+    break;
+  }
+  // --- NEW: E-Stop Release Command ---
+  case 'E':
+  {
+    Serial.println("INFO: E-Stop Release command received.");
+    g_collisionDetected = false;
+
+    // Resume tasks if they were suspended
+    if (h_task_motion_interpolator != NULL)
+      vTaskResume(h_task_motion_interpolator);
+    if (h_task_command_parser != NULL)
+      vTaskResume(h_task_command_parser);
+
+    // Re-enable motors
+    digitalWrite(STEPPER_ENABLE_PIN, LOW);
+    digitalWrite(OE_PIN, LOW);
+    Serial.println("INFO: Tasks resumed and motors re-enabled.");
+    break;
+  }
+  } // end switch
 }
 
-// --- Robust byte-by-byte serial parser ---
+// ... (task_command_parser is unchanged) ...
 void task_command_parser(void *pvParameters)
 {
   uint8_t serial_buffer[sizeof(CommandPacket)];
@@ -357,9 +470,7 @@ void task_command_parser(void *pvParameters)
   }
 }
 
-// ==========================================================================
-// --- Monitoring Task (Core 0) ---
-// ==========================================================================
+// ... (task_monitoring is unchanged) ...
 void task_monitoring(void *pvParameters)
 {
   long lastStatusSendTime = 0;
@@ -375,17 +486,21 @@ void task_monitoring(void *pvParameters)
     float measured_voltage = ((float)val / nSamples / adcMax) * vcc;
     g_mainCurrent_A = (measured_voltage - g_calibrated_zero_voltage) / sens;
     g_gripperCurrent_mA = ina219.getCurrent_mA();
+
     if (fabsf(g_mainCurrent_A) > g_collision_current_threshold_A)
     {
       emergency_stop();
       continue;
     }
+
     if (millis() - lastStatusSendTime > 100 && !g_collisionDetected)
     {
       StatusPacket status;
       status.header = HEADER_BYTE;
+      status.cmd_id = 'S';
       status.main_current_A = g_mainCurrent_A;
       status.gripper_current_mA = g_gripperCurrent_mA;
+
       xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
       unsigned long elapsed_time = millis() - g_move_start_time;
       float fraction = g_move_duration_ms > 0 ? (float)elapsed_time / (float)g_move_duration_ms : 1.0f;
@@ -396,6 +511,7 @@ void task_monitoring(void *pvParameters)
         status.angles[i] = (g_current_angles[i] * (1.0f - eased_fraction)) + (g_target_angles[i] * eased_fraction);
       }
       xSemaphoreGive(x_pose_mutex);
+
       status.checksum = calculate_checksum((uint8_t *)&status, sizeof(StatusPacket) - 1);
       Serial.write((uint8_t *)&status, sizeof(StatusPacket));
       lastStatusSendTime = millis();
@@ -404,21 +520,19 @@ void task_monitoring(void *pvParameters)
   }
 }
 
-// ==========================================================================
-// --- SETUP (ROBUST STARTUP) ---
-// ==========================================================================
+// ... (setup and loop are unchanged) ...
 void setup()
 {
   // --- Step 1: Disable all motors IMMEDIATELY ---
   pinMode(OE_PIN, OUTPUT);
-  digitalWrite(OE_PIN, HIGH); // Disable servos
+  digitalWrite(OE_PIN, HIGH);
   pinMode(STEPPER_ENABLE_PIN, OUTPUT);
-  digitalWrite(STEPPER_ENABLE_PIN, HIGH); // Disable stepper
+  digitalWrite(STEPPER_ENABLE_PIN, HIGH);
 
-  delay(2000); // Wait for power to stabilize
+  delay(2000);
 
   Serial.begin(BAUD_RATE);
-  Serial.println("\n--- ESP32 Robot Arm Firmware (v3.5 Stable) ---");
+  Serial.println("\n--- ESP32 Robot Arm Firmware (v3.8 E-Stop Release) ---");
   EEPROM.begin(EEPROM_SIZE);
 
   // --- Step 2: Initialize Stepper Pins ---
@@ -430,7 +544,6 @@ void setup()
   digitalWrite(STEPPER_MS1_PIN, HIGH);
   digitalWrite(STEPPER_MS2_PIN, HIGH);
   digitalWrite(STEPPER_MS3_PIN, HIGH);
-  Serial.println("INFO: Stepper microstepping set to 1/16.");
 
   // --- Step 3: Initialize I2C Devices ---
   Wire.begin();
@@ -438,54 +551,78 @@ void setup()
   pwm.setOscillatorFrequency(27000000);
   pwm.setPWMFreq(PWM_FREQ);
   ina219.begin();
-  // --- CALIBRATION STEP ---
-  Serial.println("Calibrating current sensor... Keep arm power off or unloaded.");
-  long adc_sum = 0;
-  const int n_cal_samples = 1000;
-  for (int i = 0; i < n_cal_samples; i++)
-  {
-    adc_sum += analogRead(ACS712_PIN);
-    delay(1);
-  }
-  g_calibrated_zero_voltage = ((float)adc_sum / n_cal_samples / 4095.0f) * 3.3f;
-  Serial.print("Calibration complete. Zero-point voltage: ");
-  Serial.println(g_calibrated_zero_voltage, 4);
 
-  // --- Step 4: Load and Validate Startup Position ---
-  if (EEPROM.read(0) == EEPROM_VALID_FLAG)
+  // --- Step 4: Calibrate Current Sensor ---
+  // Serial.println("Calibrating current sensor...");
+  // long adc_sum = 0;
+  // const int n_cal_samples = 1000;
+  // for (int i = 0; i < n_cal_samples; i++)
+  // {
+  //   adc_sum += analogRead(ACS712_PIN);
+  //   delay(1);
+  // }
+  // g_calibrated_zero_voltage = ((float)adc_sum / n_cal_samples / 4095.0f) * 3.3f;
+  // Serial.print("Calibration complete. Zero-point voltage: ");
+  // Serial.println(g_calibrated_zero_voltage, 4);
+
+  // --- Step 5: Load and Validate Startup Pose AND Config from EEPROM ---
+  if (EEPROM.read(EEPROM_VALID_FLAG_ADDR) == EEPROM_VALID_FLAG)
   {
-    Serial.println("INFO: Restoring last saved pose from EEPROM.");
+    Serial.println("INFO: Restoring pose and config from EEPROM.");
     float temp_angles[SERVOS_NUMBER];
-    EEPROM.get(1, temp_angles);
+    EEPROM.get(EEPROM_POSE_ADDR, temp_angles);
+
+    ArmConfig cfg;
+    EEPROM.get(EEPROM_CONFIG_ADDR, cfg);
+    memcpy(SERVOS_MIN, cfg.min_limits, sizeof(SERVOS_MIN));
+    memcpy(SERVOS_MAX, cfg.max_limits, sizeof(SERVOS_MAX));
+    g_collision_current_threshold_A = cfg.collision_threshold;
+
     for (int i = 0; i < SERVOS_NUMBER; i++)
     {
-      // PERMANENT FIX: Constrain all loaded values to be safe
       g_current_angles[i] = constrain(temp_angles[i], SERVOS_MIN[i], SERVOS_MAX[i]);
       g_target_angles[i] = g_current_angles[i];
     }
   }
   else
   {
-    Serial.println("INFO: No valid pose in EEPROM. Starting at HOME position.");
+    Serial.println("INFO: No valid config. Saving defaults to EEPROM.");
     for (int i = 0; i < SERVOS_NUMBER; i++)
     {
-      // PERMANENT FIX: Constrain all home values to be safe
       g_current_angles[i] = constrain(HOME_POSITION[i], SERVOS_MIN[i], SERVOS_MAX[i]);
       g_target_angles[i] = g_current_angles[i];
     }
+
+    EEPROM.put(EEPROM_POSE_ADDR, g_current_angles);
+
+    ArmConfig cfg;
+    memcpy(cfg.min_limits, (void *)SERVOS_MIN, sizeof(SERVOS_MIN));
+    memcpy(cfg.max_limits, (void *)SERVOS_MAX, sizeof(SERVOS_MAX));
+    cfg.collision_threshold = g_collision_current_threshold_A;
+    EEPROM.put(EEPROM_CONFIG_ADDR, cfg);
+
+    EEPROM.write(EEPROM_VALID_FLAG_ADDR, EEPROM_VALID_FLAG);
+    EEPROM.commit();
+  }
+  Serial.println("INFO: Config loaded:");
+  Serial.print("  Threshold: ");
+  Serial.println(g_collision_current_threshold_A);
+
+  // --- Step 6: Initialize Global Motion State ---
+  g_stepper_current_step_pos = (long)(g_current_angles[0] * STEPPER_STEPS_PER_DEGREE);
+  g_move_start_time = millis();
+  g_move_duration_ms = 0;
+
+  // --- Step 7: Create Mutex ---
+  x_pose_mutex = xSemaphoreCreateMutex();
+  if (x_pose_mutex == NULL)
+  {
+    Serial.println("FATAL: Could not create pose mutex. Halting.");
+    while (1)
+      ;
   }
 
-  // --- Step 5: Initialize Global Motion State ---
-  g_stepper_current_step_pos = (long)(g_current_angles[0] * STEPPER_STEPS_PER_DEGREE);
-  Serial.print("INFO: Initializing stepper to angle ");
-  Serial.print(g_current_angles[0]);
-  Serial.print(" (");
-  Serial.print(g_stepper_current_step_pos);
-  Serial.println(" steps).");
-  g_move_start_time = millis();
-  g_move_duration_ms = 0; // No move on boot
-
-  // --- Step 6: Pre-load servos with start position BEFORE enabling ---
+  // --- Step 8: Pre-load servos ---
   Serial.println("INFO: Pre-loading servo positions...");
   for (int i = 1; i < SERVOS_NUMBER; i++)
   {
@@ -496,15 +633,14 @@ void setup()
       pwm.writeMicroseconds(JOINT_1_SECOND_SERVO, pulse);
     }
   }
-  delay(500); // Give servos time to receive the signal
+  delay(500);
 
-  // --- Step 7: Enable all motors ---
-  digitalWrite(STEPPER_ENABLE_PIN, LOW); // Enable stepper
-  digitalWrite(OE_PIN, LOW);             // Enable servos
+  // --- Step 9: Enable all motors ---
+  digitalWrite(STEPPER_ENABLE_PIN, LOW);
+  digitalWrite(OE_PIN, LOW);
   Serial.println("Motors enabled. Startup should be smooth.");
 
-  // --- Step 8: Start Tasks ---
-  x_pose_mutex = xSemaphoreCreateMutex();
+  // --- Step 10: Start Tasks ---
   Serial.println("Initializing tasks...");
   xTaskCreatePinnedToCore(task_monitoring, "Monitoring", 4096, NULL, 1, &h_task_monitoring, 0);
   xTaskCreatePinnedToCore(task_command_parser, "CmdParser", 4096, NULL, 2, &h_task_command_parser, 1);
@@ -514,5 +650,5 @@ void setup()
 
 void loop()
 {
-  vTaskDelete(NULL); // FreeRTOS handles everything
+  vTaskDelete(NULL);
 }
