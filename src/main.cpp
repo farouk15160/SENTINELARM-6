@@ -1,18 +1,20 @@
 /**
  * @file main.cpp
- * @brief Fully interruptible, non-blocking firmware for ROS2 Robot Arm with auto-calibration and optimizations
+ * @brief Fully interruptible, non-blocking firmware for ROS2 Robot Arm
  * @author Farouk
- * @date 19 Oct 2025
+ * @date 26 Oct 2025
  *
  * @description
- * This firmware uses a non-blocking, dual-task architecture for motion control.
- *
- * Version 3.8 (E-Stop Release Feature):
- * - Added new command 'E': Releases E-Stop. Resets collision flag, resumes suspended
- * tasks (motion and parser), and re-enables motor power.
- * - `emergency_stop()` is now safer and won't try to suspend null tasks.
- * - Added EEPROM persistence for Min/Max limits and collision threshold.
- * - `StatusPacket` now has a `cmd_id` of 'S' (0x53) for multi-packet parsing.
+ * Version 3.9.2 (Deviation Grace Period Fix):
+ * - [FIX] Behebt fälschliche E-Stops bei normalen Bewegungen.
+ * - [NEU] Fügt eine 300ms "Grace Period" (DEVIATION_GRACE_PERIOD_MS) in task_monitoring hinzu.
+ * - [FIX] Der Deviation-Check wird nun erst 300ms *nach* dem Start einer Bewegung
+ * aktiviert, um den normalen Anlaufstrom (inrush current) zu ignorieren.
+ * - [NEU] Fügt "Deviation Threshold" (g_collision_deviation_threshold_A) hinzu.
+ * - [NEU] Fügt einen IIR-Filter in task_monitoring hinzu.
+ * - [NEU] Implementiert Befehl 'D' zum Setzen des Deviation Threshold.
+ * - [NEU] Aktualisiert ConfigPacket, ArmConfig und EEPROM-Logik.
+ * - [FIX] Behebt den "Status Timeout" E-Stop-Fehler (collision_flag).
  */
 
 #include <Wire.h>
@@ -32,10 +34,17 @@ const int STEPPER_ENABLE_PIN = 4;
 #define STEPPER_STEPS_PER_REV 200
 #define STEPPER_MICROSTEPS 16
 #define STEPPER_GEAR_RATIO 5.0f
-#define STEPPER_PULSE_WIDTH_US 10 // old 50
+#define STEPPER_PULSE_WIDTH_US 10
 #define STEPPER_PULSE_DELAY_US 500
 
 const float STEPPER_STEPS_PER_DEGREE = (STEPPER_STEPS_PER_REV * STEPPER_MICROSTEPS * STEPPER_GEAR_RATIO) / 360.0f;
+
+// --- 12V Lüfter PWM Konfiguration ---
+#define FAN_PWM_PIN 26
+#define FAN_PWM_CHANNEL 0
+#define FAN_PWM_FREQ 25000
+#define FAN_PWM_RESOLUTION 8
+#define FAN_DUTY_CYCLE_7_PERCENT 18
 
 // ==========================================================================
 // --- Multi-Tasking & Safety Configuration ---
@@ -44,8 +53,10 @@ TaskHandle_t h_task_command_parser = NULL;
 TaskHandle_t h_task_monitoring = NULL;
 TaskHandle_t h_task_motion_interpolator = NULL;
 SemaphoreHandle_t x_pose_mutex;
+SemaphoreHandle_t x_i2c_mutex;
 
 volatile float g_collision_current_threshold_A = 5.0f;
+volatile float g_collision_deviation_threshold_A = 1.0f; // --- NEU V3.9.1 ---
 volatile bool g_collisionDetected = false;
 volatile float g_mainCurrent_A = 0.0;
 volatile float g_gripperCurrent_mA = 0.0;
@@ -58,6 +69,7 @@ unsigned long g_move_start_time;
 unsigned long g_move_duration_ms;
 volatile float g_grip_target_current_mA = -1.0f;
 volatile long g_stepper_current_step_pos = 0;
+volatile int g_fan_duty_cycle = FAN_DUTY_CYCLE_7_PERCENT;
 
 // ==========================================================================
 // --- Hardware & Servo Configuration ---
@@ -84,7 +96,7 @@ const bool SERVO_INVERT[SERVOS_NUMBER] = {false, true, false, false, false, fals
 const int16_t TRIM_US[SERVOS_NUMBER] = {0, 0, 0, 0, 0, 0};
 
 // ==========================================================================
-// --- EEPROM Configuration ---
+// --- EEPROM Configuration (v3.9.1) ---
 // ==========================================================================
 #define EEPROM_SIZE 128
 #define EEPROM_VALID_FLAG 123
@@ -97,10 +109,11 @@ struct ArmConfig
   float min_limits[SERVOS_NUMBER];
   float max_limits[SERVOS_NUMBER];
   float collision_threshold;
+  float deviation_threshold; // --- NEU V3.9.1 ---
 };
 
 // ==========================================================================
-// --- Binary Communication Protocol ---
+// --- Binary Communication Protocol (v3.9.1) ---
 // ==========================================================================
 #define HEADER_BYTE 0xA5
 #pragma pack(push, 1)
@@ -120,6 +133,7 @@ struct StatusPacket
   float main_current_A;
   float gripper_current_mA;
   float angles[6];
+  uint8_t collision_flag; // --- NEU V3.9.1 (E-Stop Fix) ---
   uint8_t checksum;
 };
 struct ConfigPacket
@@ -129,6 +143,7 @@ struct ConfigPacket
   float min_limits[6];
   float max_limits[6];
   float collision_threshold;
+  float deviation_threshold; // --- NEU V3.9.1 ---
   uint8_t checksum;
 };
 #pragma pack(pop)
@@ -177,13 +192,12 @@ void emergency_stop()
   g_collisionDetected = true;
   digitalWrite(OE_PIN, HIGH);
   digitalWrite(STEPPER_ENABLE_PIN, HIGH);
-  Serial.println("\nE-STOP: Main current limit exceeded. Halting.\n");
+  // Serial.println("\nE-STOP: Halting.\n"); // Note: Serial prints in emergency_stop can be risky
 
-  // --- MODIFIED: Check task handles are valid before suspending ---
   if (h_task_motion_interpolator != NULL)
     vTaskSuspend(h_task_motion_interpolator);
-  if (h_task_command_parser != NULL)
-    vTaskSuspend(h_task_command_parser);
+
+  // The command parser task MUST remain active to receive the 'E' (release) command.
 }
 
 // ==========================================================================
@@ -220,6 +234,7 @@ void task_motion_interpolator(void *pvParameters)
     long current_target_step_pos = start_step_pos + (long)(total_steps_for_move * eased_fraction);
     long steps_to_move = current_target_step_pos - g_stepper_current_step_pos;
 
+    // --- Stepper-Logik (Kein I2C, sicher) ---
     if (steps_to_move != 0)
     {
       digitalWrite(STEPPER_DIR_PIN, (steps_to_move > 0) ? (SERVO_INVERT[0] ? HIGH : LOW) : (SERVO_INVERT[0] ? LOW : HIGH));
@@ -234,6 +249,7 @@ void task_motion_interpolator(void *pvParameters)
       g_stepper_current_step_pos = current_target_step_pos;
     }
 
+    // --- Servo-Logik (NUTZT I2C, MUSS GESCHÜTZT WERDEN) ---
     for (int i = 1; i < SERVOS_NUMBER; i++)
     {
       float interpolated_angle = (g_current_angles[i] * (1.0f - eased_fraction)) + (g_target_angles[i] * eased_fraction);
@@ -242,11 +258,13 @@ void task_motion_interpolator(void *pvParameters)
       int pulse = angleToPulse(interpolated_angle, i);
       xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
 
+      xSemaphoreTake(x_i2c_mutex, portMAX_DELAY);
       pwm.writeMicroseconds(SERVOS[i], pulse);
       if (i == 1)
       {
         pwm.writeMicroseconds(JOINT_1_SECOND_SERVO, pulse);
       }
+      xSemaphoreGive(x_i2c_mutex);
     }
 
     if (fraction >= 1.0f)
@@ -257,6 +275,7 @@ void task_motion_interpolator(void *pvParameters)
         g_current_angles[i] = g_target_angles[i];
       }
       g_stepper_current_step_pos = end_step_pos;
+      g_move_duration_ms = 0; // --- WICHTIG: Bewegung als beendet markieren ---
     }
     xSemaphoreGive(x_pose_mutex);
   }
@@ -267,7 +286,6 @@ void task_motion_interpolator(void *pvParameters)
 // ==========================================================================
 void parse_command(const CommandPacket &cmd)
 {
-  // --- MODIFIED: Allow 'E' command even if collision was detected ---
   if (g_collisionDetected && cmd.cmd_id != 'E')
     return;
 
@@ -312,6 +330,8 @@ void parse_command(const CommandPacket &cmd)
     g_move_start_time = millis();
     float speed = (cmd.speed_factor > 0.01f) ? cmd.speed_factor : 10.0f;
     g_move_duration_ms = max_angle_delta * speed;
+    if (g_move_duration_ms < 50)
+      g_move_duration_ms = 50; // Mindestbewegungszeit
     if (cmd.cmd_id == 'H')
       g_move_duration_ms = 3000;
     xSemaphoreGive(x_pose_mutex);
@@ -375,6 +395,18 @@ void parse_command(const CommandPacket &cmd)
     }
     break;
   }
+  // --- NEU V3.9.1: Deviation Threshold setzen ---
+  case 'D':
+  {
+    float new_threshold = cmd.speed_factor;
+    if (new_threshold > 0.05f && new_threshold < 10.0f)
+    {
+      g_collision_deviation_threshold_A = new_threshold;
+      Serial.print("INFO: Deviation current threshold set to: ");
+      Serial.println(g_collision_deviation_threshold_A);
+    }
+    break;
+  }
   case 'C':
   {
     xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
@@ -382,6 +414,7 @@ void parse_command(const CommandPacket &cmd)
     memcpy(cfg.min_limits, (void *)SERVOS_MIN, sizeof(SERVOS_MIN));
     memcpy(cfg.max_limits, (void *)SERVOS_MAX, sizeof(SERVOS_MAX));
     cfg.collision_threshold = g_collision_current_threshold_A;
+    cfg.deviation_threshold = g_collision_deviation_threshold_A; // --- NEU V3.9.1 ---
 
     EEPROM.put(EEPROM_CONFIG_ADDR, cfg);
     EEPROM.write(EEPROM_VALID_FLAG_ADDR, EEPROM_VALID_FLAG);
@@ -401,6 +434,7 @@ void parse_command(const CommandPacket &cmd)
     memcpy(packet.min_limits, (void *)SERVOS_MIN, sizeof(SERVOS_MIN));
     memcpy(packet.max_limits, (void *)SERVOS_MAX, sizeof(SERVOS_MAX));
     packet.collision_threshold = g_collision_current_threshold_A;
+    packet.deviation_threshold = g_collision_deviation_threshold_A; // --- NEU V3.9.1 ---
     xSemaphoreGive(x_pose_mutex);
 
     packet.checksum = calculate_checksum((uint8_t *)&packet, sizeof(ConfigPacket) - 1);
@@ -408,28 +442,32 @@ void parse_command(const CommandPacket &cmd)
     Serial.println("INFO: Sent config report.");
     break;
   }
-  // --- NEW: E-Stop Release Command ---
   case 'E':
   {
     Serial.println("INFO: E-Stop Release command received.");
     g_collisionDetected = false;
 
-    // Resume tasks if they were suspended
     if (h_task_motion_interpolator != NULL)
       vTaskResume(h_task_motion_interpolator);
-    if (h_task_command_parser != NULL)
-      vTaskResume(h_task_command_parser);
 
-    // Re-enable motors
     digitalWrite(STEPPER_ENABLE_PIN, LOW);
     digitalWrite(OE_PIN, LOW);
     Serial.println("INFO: Tasks resumed and motors re-enabled.");
     break;
   }
+
+  case 'F':
+  {
+    int dutyCycle = (int)cmd.angles[0];
+    g_fan_duty_cycle = constrain(dutyCycle, 0, 255);
+
+    Serial.print("INFO: Fan duty cycle set to ");
+    Serial.println(g_fan_duty_cycle);
+    break;
+  }
   } // end switch
 }
 
-// ... (task_command_parser is unchanged) ...
 void task_command_parser(void *pvParameters)
 {
   uint8_t serial_buffer[sizeof(CommandPacket)];
@@ -470,7 +508,16 @@ void task_command_parser(void *pvParameters)
   }
 }
 
-// ... (task_monitoring is unchanged) ...
+// ==========================================================================
+// --- Monitoring Task (Core 0, Low Priority) ---
+// ==========================================================================
+
+// --- NEU V3.9.2: Grace Period (in ms) ---
+// Zeit, die nach dem Start einer Bewegung gewartet wird, bevor die
+// Abweichungsprüfung (Deviation Check) aktiviert wird, um den
+// normalen Anlaufstrom (Inrush Current) zu ignorieren.
+#define DEVIATION_GRACE_PERIOD_MS 300
+
 void task_monitoring(void *pvParameters)
 {
   long lastStatusSendTime = 0;
@@ -478,28 +525,90 @@ void task_monitoring(void *pvParameters)
   const float sens = 0.066;
   const float vcc = 3.3;
   const int adcMax = 4095;
+
+  int last_fan_duty_cycle = -1;
+
+  // --- NEU V3.9.1: Deviation-Logik ---
+  static float g_avgCurrent_A = 0.0f;
+  const float IIR_ALPHA = 0.1f; // 0.1 = schnelle Anpassung, 0.01 = glatter
+
   for (;;)
   {
+    // --- 1. Strommessung (Analog, sicher) ---
     long val = 0;
     for (int i = 0; i < nSamples; i++)
       val += analogRead(ACS712_PIN);
     float measured_voltage = ((float)val / nSamples / adcMax) * vcc;
     g_mainCurrent_A = (measured_voltage - g_calibrated_zero_voltage) / sens;
-    g_gripperCurrent_mA = ina219.getCurrent_mA();
 
+    // --- NEU V3.9.1: Deviation-Logik ---
+    float current_deviation = fabsf(g_mainCurrent_A - g_avgCurrent_A);
+    // Aktualisiere den Durchschnitt IMMER, damit er der Bewegung folgt
+    g_avgCurrent_A = (g_avgCurrent_A * (1.0f - IIR_ALPHA)) + (g_mainCurrent_A * IIR_ALPHA);
+
+    // --- 2. Greiferstrom (I2C, muss geschützt werden) ---
+    xSemaphoreTake(x_i2c_mutex, portMAX_DELAY);
+    float raw_grip_current = ina219.getCurrent_mA();
+    xSemaphoreGive(x_i2c_mutex);
+
+    if (isnan(raw_grip_current) || isinf(raw_grip_current))
+    {
+      g_gripperCurrent_mA = 0.0f;
+    }
+    else
+    {
+      g_gripperCurrent_mA = raw_grip_current;
+    }
+
+    // --- 3. Lüftersteuerung (PWM, sicher auf Core 0) ---
+    if (g_fan_duty_cycle != last_fan_duty_cycle)
+    {
+      ledcWrite(FAN_PWM_CHANNEL, g_fan_duty_cycle);
+      last_fan_duty_cycle = g_fan_duty_cycle;
+    }
+
+    // --- 4. Sicherheitscheck (Absoluter Grenzwert) ---
     if (fabsf(g_mainCurrent_A) > g_collision_current_threshold_A)
     {
+      Serial.println("E-STOP: Absolute threshold exceeded!");
+      emergency_stop();
+      continue; // Gehe zum Anfang der Schleife, Status wird gesendet
+    }
+
+    // --- 5. Sicherheitscheck (Abweichungs-Grenzwert) ---
+    xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
+    unsigned long current_duration = g_move_duration_ms;
+    unsigned long current_start_time = g_move_start_time;
+    xSemaphoreGive(x_pose_mutex);
+
+    bool is_moving = (millis() - current_start_time) < current_duration;
+
+    // --- NEU V3.9.2: Grace Period Check ---
+    // Prüfe die Abweichung nur, wenn:
+    // 1. Der Arm sich bewegen SOLL (is_moving == true)
+    // 2. Die Grace Period (Anlaufstrom-Phase) VORBEI ist.
+    bool grace_period_over = (millis() - current_start_time) > DEVIATION_GRACE_PERIOD_MS;
+
+    if (is_moving && grace_period_over && (current_deviation > g_collision_deviation_threshold_A))
+    {
+      Serial.print("E-STOP: Deviation threshold exceeded! Dev: ");
+      Serial.println(current_deviation);
       emergency_stop();
       continue;
     }
 
-    if (millis() - lastStatusSendTime > 100 && !g_collisionDetected)
+    // --- 6. Statuspaket senden ---
+    // --- E-STOP TIMEOUT FIX: Sende Status IMMER ---
+    if (millis() - lastStatusSendTime > 100)
     {
       StatusPacket status;
       status.header = HEADER_BYTE;
       status.cmd_id = 'S';
       status.main_current_A = g_mainCurrent_A;
       status.gripper_current_mA = g_gripperCurrent_mA;
+
+      // --- NEU V3.9.1: E-Stop-Statusflag setzen ---
+      status.collision_flag = g_collisionDetected ? 1 : 0;
 
       xSemaphoreTake(x_pose_mutex, portMAX_DELAY);
       unsigned long elapsed_time = millis() - g_move_start_time;
@@ -520,7 +629,47 @@ void task_monitoring(void *pvParameters)
   }
 }
 
-// ... (setup and loop are unchanged) ...
+// I2C-Scanner-Funktion
+void scan_i2c_availble_address()
+{
+  byte error, address;
+  int nDevices;
+  Serial.println("Scanning...");
+  nDevices = 0;
+  for (address = 1; address < 127; address++)
+  {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0)
+    {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16)
+      {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+      nDevices++;
+    }
+    else if (error == 4)
+    {
+      Serial.print("Unknow error at address 0x");
+      if (address < 16)
+      {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+    }
+  }
+  if (nDevices == 0)
+  {
+    Serial.println("No I2C devices found\n");
+  }
+  else
+  {
+    Serial.println("done\n");
+  }
+}
+
 void setup()
 {
   // --- Step 1: Disable all motors IMMEDIATELY ---
@@ -532,7 +681,7 @@ void setup()
   delay(2000);
 
   Serial.begin(BAUD_RATE);
-  Serial.println("\n--- ESP32 Robot Arm Firmware (v3.8 E-Stop Release) ---");
+  Serial.println("\n--- ESP32 Robot Arm Firmware (v3.9.2 Grace Period Fix) ---"); // Version aktualisiert
   EEPROM.begin(EEPROM_SIZE);
 
   // --- Step 2: Initialize Stepper Pins ---
@@ -547,23 +696,37 @@ void setup()
 
   // --- Step 3: Initialize I2C Devices ---
   Wire.begin();
+  // scan_i2c_availble_address();
   pwm.begin();
   pwm.setOscillatorFrequency(27000000);
   pwm.setPWMFreq(PWM_FREQ);
-  ina219.begin();
+
+  if (!ina219.begin())
+  {
+    Serial.println("WARN: Failed to find INA219 sensor at 0x41. Gripper current will read 0.");
+  }
+
+  // --- Lüfter-PWM initialisieren ---
+  Serial.println("INFO: Initializing 12V Fan PWM...");
+  ledcSetup(FAN_PWM_CHANNEL, FAN_PWM_FREQ, FAN_PWM_RESOLUTION);
+  ledcAttachPin(FAN_PWM_PIN, FAN_PWM_CHANNEL);
+  Serial.println("INFO: Setting fan speed to 7% at startup.");
+  ledcWrite(FAN_PWM_CHANNEL, g_fan_duty_cycle);
 
   // --- Step 4: Calibrate Current Sensor ---
-  // Serial.println("Calibrating current sensor...");
-  // long adc_sum = 0;
-  // const int n_cal_samples = 1000;
-  // for (int i = 0; i < n_cal_samples; i++)
-  // {
-  //   adc_sum += analogRead(ACS712_PIN);
-  //   delay(1);
-  // }
-  // g_calibrated_zero_voltage = ((float)adc_sum / n_cal_samples / 4095.0f) * 3.3f;
-  // Serial.print("Calibration complete. Zero-point voltage: ");
-  // Serial.println(g_calibrated_zero_voltage, 4);
+  Serial.println("INFO: Calibrating current sensor. Do not move the robot...");
+  long adc_sum = 0;
+  const int n_cal_samples = 1000;
+  const float vcc = 3.3;
+  const int adcMax = 4095;
+  for (int i = 0; i < n_cal_samples; i++)
+  {
+    adc_sum += analogRead(ACS712_PIN);
+    delay(1);
+  }
+  g_calibrated_zero_voltage = ((float)adc_sum / n_cal_samples / adcMax) * vcc;
+  Serial.print("INFO: Calibration complete. Zero-point voltage: ");
+  Serial.println(g_calibrated_zero_voltage, 4);
 
   // --- Step 5: Load and Validate Startup Pose AND Config from EEPROM ---
   if (EEPROM.read(EEPROM_VALID_FLAG_ADDR) == EEPROM_VALID_FLAG)
@@ -577,6 +740,7 @@ void setup()
     memcpy(SERVOS_MIN, cfg.min_limits, sizeof(SERVOS_MIN));
     memcpy(SERVOS_MAX, cfg.max_limits, sizeof(SERVOS_MAX));
     g_collision_current_threshold_A = cfg.collision_threshold;
+    g_collision_deviation_threshold_A = cfg.deviation_threshold; // --- NEU V3.9.1 ---
 
     for (int i = 0; i < SERVOS_NUMBER; i++)
     {
@@ -592,37 +756,40 @@ void setup()
       g_current_angles[i] = constrain(HOME_POSITION[i], SERVOS_MIN[i], SERVOS_MAX[i]);
       g_target_angles[i] = g_current_angles[i];
     }
-
     EEPROM.put(EEPROM_POSE_ADDR, g_current_angles);
-
     ArmConfig cfg;
     memcpy(cfg.min_limits, (void *)SERVOS_MIN, sizeof(SERVOS_MIN));
     memcpy(cfg.max_limits, (void *)SERVOS_MAX, sizeof(SERVOS_MAX));
     cfg.collision_threshold = g_collision_current_threshold_A;
+    cfg.deviation_threshold = g_collision_deviation_threshold_A; // --- NEU V3.9.1 ---
     EEPROM.put(EEPROM_CONFIG_ADDR, cfg);
 
     EEPROM.write(EEPROM_VALID_FLAG_ADDR, EEPROM_VALID_FLAG);
     EEPROM.commit();
   }
   Serial.println("INFO: Config loaded:");
-  Serial.print("  Threshold: ");
+  Serial.print("  Abs. Threshold: ");
   Serial.println(g_collision_current_threshold_A);
+  Serial.print("  Dev. Threshold: ");
+  Serial.println(g_collision_deviation_threshold_A); // --- NEU V3.9.1 ---
 
   // --- Step 6: Initialize Global Motion State ---
   g_stepper_current_step_pos = (long)(g_current_angles[0] * STEPPER_STEPS_PER_DEGREE);
   g_move_start_time = millis();
   g_move_duration_ms = 0;
 
-  // --- Step 7: Create Mutex ---
+  // --- Step 7: Create Mutexes ---
   x_pose_mutex = xSemaphoreCreateMutex();
-  if (x_pose_mutex == NULL)
+  x_i2c_mutex = xSemaphoreCreateMutex();
+
+  if (x_pose_mutex == NULL || x_i2c_mutex == NULL)
   {
-    Serial.println("FATAL: Could not create pose mutex. Halting.");
+    Serial.println("FATAL: Could not create mutex. Halting.");
     while (1)
       ;
   }
 
-  // --- Step 8: Pre-load servos ---
+  // --- Step 8: Pre-load servos (Sicher, da Tasks noch nicht laufen) ---
   Serial.println("INFO: Pre-loading servo positions...");
   for (int i = 1; i < SERVOS_NUMBER; i++)
   {

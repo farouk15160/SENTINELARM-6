@@ -5,7 +5,8 @@ framework = arduino
 lib_deps =
     adafruit/Adafruit PWM Servo Driver Library
     adafruit/Adafruit INA219
-    ; FastLED/FastLED
+    fastled/FastLED  
+
 monitor_speed = 921600 
 
 ; custom_microros_distro = foxy
