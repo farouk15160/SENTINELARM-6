@@ -1,9 +1,0 @@
-{
-    "names": {
-        "custom_interfaces": {
-            "cmake-args": [
-                "-DCUSTOM_INTERFACES_BUILD_TESTING=OFF"
-            ]
-        }
-    }
-}
